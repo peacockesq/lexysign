@@ -25,3 +25,8 @@ yarn-error.log*
 apps/OpenSign/public/mfbuild/*
 microfrontends/SignDocuments/build/*
 apps/OpenSignServer/files/files/*
+scripts/mcp/.venv/
+scripts/mcp/.pytest_cache/
+scripts/mcp/*.egg-info/
+scripts/mcp/**/__pycache__/
+scripts/mcp/build/

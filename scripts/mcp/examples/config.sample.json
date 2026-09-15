@@ -1,0 +1,19 @@
+{
+  "parse_base_url": "https://sign.lexyalgo.com/api/app",
+  "parse_app_id": "opensign",
+  "tenant_id": "REPLACE_TENANT_OBJECT_ID",
+  "principal_user_id": "REPLACE_USER_OBJECT_ID",
+  "principal_extuser_id": "REPLACE_CONTRACTS_USERS_OBJECT_ID",
+  "session_token_file": "/home/trixie/.hermes/profiles/cain/secrets/lexysign-session",
+  "approval_secret_file": "/home/trixie/.hermes/profiles/cain/secrets/lexysign-mcp-approval",
+  "allowed_pdf_roots": ["/home/trixie/firm-docs"],
+  "download_root": "/home/trixie/firm-docs/signed",
+  "state_dir": "/home/trixie/.hermes/profiles/cain/lexysign-mcp-state",
+  "public_origin": "https://sign.lexyalgo.com",
+  "max_pdf_bytes": 26214400,
+  "manifest_ttl_seconds": 3600,
+  "approval_ttl_seconds": 1800,
+  "http_timeout_seconds": 30,
+  "page_limit": 50,
+  "object_storage_origins": []
+}

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools==69.5.1", "wheel==0.43.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lexysign-firm-mcp"
+version = "0.1.0"
+description = "Local stdio MCP adapter for LexySign firm document workflows"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.0.0",
+  "httpx==0.28.1",
+  "pypdf==5.9.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.5"]
+
+[project.scripts]
+lexysign-firm-mcp = "lexysign_firm_mcp.__main__:main"
+lexysign-mcp-approve = "lexysign_firm_mcp.approve_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lexysign_firm_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

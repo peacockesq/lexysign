@@ -88,6 +88,7 @@
     "build-win": "npm run version-win && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:node": "node --test test-node/*.test.mjs",
     "release": "standard-version",
     "commit": "cz"
   },

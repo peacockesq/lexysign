@@ -20,7 +20,7 @@ const {
   clearSupabaseSession,
   isSupabaseAuthEnabled,
   persistSupabaseSession,
-} = await import('./supabaseAuth.js');
+} = await import('../src/auth/supabaseAuth.js');
 
 describe('LexySign Supabase auth bridge', () => {
   afterEach(() => {

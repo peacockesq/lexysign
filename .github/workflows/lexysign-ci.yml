@@ -30,33 +30,114 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Server syntax checks
         run: |
+          set -euo pipefail
           node --check apps/OpenSignServer/Utils.js
+          node --check apps/OpenSignServer/index.js
+          node --check apps/OpenSignServer/cloud/main.js
           node --check apps/OpenSignServer/cloud/customRoute/billing.js
+          node --check apps/OpenSignServer/cloud/customRoute/customApp.js
           node --check apps/OpenSignServer/billing/stripeClient.js
+          node --check apps/OpenSignServer/billing/entitlements.js
           node --check apps/OpenSignServer/cloud/parsefunction/loginWithSupabase.js
           node --check apps/OpenSignServer/cloud/customRoute/docxtopdf.js
+          node --check apps/OpenSignServer/cloud/customRoute/deleteAccount/deleteFileUrl.js
+          node --check apps/OpenSignServer/cloud/parsefunction/AddAdmin.js
+          node --check apps/OpenSignServer/spec/lexysignContracts.test.js
       - name: Secret value scan on changed files
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
           else
             BASE_SHA="${{ github.event.before }}"
           fi
-          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-            BASE_SHA="${{ github.sha }}^"
+          if [[ -z "${BASE_SHA}" || "${BASE_SHA}" =~ ^0+$ ]]; then
+            if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+              BASE_SHA="$(git rev-parse HEAD^)"
+            else
+              echo "Unable to determine a scan base SHA; refusing to skip." >&2
+              exit 1
+            fi
           fi
-          git diff --name-only "$BASE_SHA" "${{ github.sha }}" \
-            | grep -Ev '(^|/)(package-lock\.json|.*\.png|.*\.ico)$' \
-            > /tmp/changed-files.txt || true
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Scan base ${BASE_SHA} is not present in this checkout; refusing to skip." >&2
+            exit 1
+          fi
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if ! git diff --name-only --diff-filter=ACMRT "${BASE_SHA}" "${HEAD_SHA}" > /tmp/changed-files.raw; then
+            echo "git diff failed for ${BASE_SHA}..${HEAD_SHA}; refusing to skip." >&2
+            exit 1
+          fi
+          : > /tmp/changed-files.txt
+          while IFS= read -r path || [[ -n "${path}" ]]; do
+            [[ -z "${path}" ]] && continue
+            case "${path}" in
+              package-lock.json|*/package-lock.json|*.png|*.ico) continue ;;
+            esac
+            if [[ -d "${path}" ]]; then
+              continue
+            fi
+            if [[ ! -f "${path}" ]]; then
+              echo "Changed path is not a readable file after checkout (deleted or missing): ${path}" >&2
+              continue
+            fi
+            printf '%s\n' "${path}" >> /tmp/changed-files.txt
+          done < /tmp/changed-files.raw
+          pattern='AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY-----|sk_live_[A-Za-z0-9]{20,}|whsec_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'
+          failed=0
           if [[ -s /tmp/changed-files.txt ]]; then
-            ! xargs grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY-----|sk_live_[A-Za-z0-9]{20,}|whsec_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}' < /tmp/changed-files.txt
+            while IFS= read -r path || [[ -n "${path}" ]]; do
+              [[ -z "${path}" ]] && continue
+              if grep -qE "${pattern}" -- "${path}"; then
+                echo "Secret pattern matched in ${path}" >&2
+                failed=1
+              fi
+            done < /tmp/changed-files.txt
           fi
+          exit "${failed}"
+
+  server-node-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/OpenSignServer/package-lock.json
+      - name: Install server dependencies
+        working-directory: apps/OpenSignServer
+        run: npm ci --omit=dev --no-audit --no-fund
+      - name: Node contract tests
+        working-directory: apps/OpenSignServer
+        run: npm run test:node
+
+  client-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/OpenSign/package-lock.json
+      - name: Install client dependencies
+        working-directory: apps/OpenSign
+        run: npm ci --no-audit --no-fund
+      - name: Node contract tests
+        working-directory: apps/OpenSign
+        run: npm run test:node
+      - name: Vitest
+        working-directory: apps/OpenSign
+        run: npm test
 
   docker-build:
     runs-on: ubuntu-latest

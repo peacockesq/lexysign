@@ -1,79 +1,50 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { loadSourceModule, readRepoFile } from "./helpers/load-source-module.mjs";
+import { sliceBetween } from "./helpers/extract-source.mjs";
 import { createParseStub } from "./helpers/parse-stub.mjs";
 import { openSignSrc, serverSrc } from "./helpers/paths.mjs";
-
-function classifyPlaceholderReopen(documentData) {
-  const alreadyPlaceholder = documentData[0] && documentData[0].SignedUrl;
-  if (!alreadyPlaceholder) return { locked: false, reason: "editable" };
-  const isCompleted = documentData[0].IsCompleted && documentData[0].IsCompleted;
-  const expireDate = documentData[0].ExpiryDate.iso;
-  const declined = documentData[0].IsDeclined && documentData[0].IsDeclined;
-  const expireUpdateDate = new Date(expireDate).getTime();
-  const currDate = new Date("2026-09-15T12:00:00.000Z").getTime();
-  if (isCompleted) return { locked: true, reason: "completed" };
-  if (declined) return { locked: true, reason: "declined" };
-  if (currDate > expireUpdateDate) return { locked: true, reason: "expired" };
-  return { locked: true, reason: "already-dispatched" };
-}
+import {
+  isDispatchedLock,
+  runCustomizeMailClose,
+  runInterruptedSendSequence
+} from "./helpers/send-state-harness.mjs";
 
 describe("sender cancel-dialog / send-state recovery", () => {
   const placeholderSrc = readRepoFile(openSignSrc("pages/PlaceHolderSign.jsx"));
   const customizeMailSrc = readRepoFile(openSignSrc("components/pdf/CustomizeMail.jsx"));
 
-  it("saveDocumentDetails commits SignedUrl and SentToOthers before any sendmailv3 call", () => {
-    const saveStart = placeholderSrc.indexOf("const saveDocumentDetails");
-    const saveEnd = placeholderSrc.indexOf("const copytoclipboard");
-    const saveFn = placeholderSrc.slice(saveStart, saveEnd);
+  it("static: saveDocumentDetails PUT text includes SentToOthers before mail helpers", () => {
+    const saveFn = sliceBetween(
+      placeholderSrc,
+      "const saveDocumentDetails = utils.withSessionValidation(async () => {",
+      "\n  const copytoclipboard"
+    );
     assert.match(saveFn, /SentToOthers:\s*true/);
     assert.match(saveFn, /SignedUrl:\s*pdfUrl/);
     assert.equal(saveFn.includes("sendmailv3"), false);
     assert.match(saveFn, /setIsMailModal\(true\)/);
   });
 
-  it("CustomizeMail Send is the sendEmailToSigners path, and close navigates away without sending", () => {
-    assert.match(customizeMailSrc, /sendEmailToSigners/);
-    assert.match(customizeMailSrc, /onClick=\{\(\) => handleEmailSendToSigners\(\)\}/);
-    const closeFn = customizeMailSrc.slice(
-      customizeMailSrc.indexOf("const handleCloseSendmailModal"),
-      customizeMailSrc.indexOf("const handleEmailSendToSigners")
-    );
-    assert.match(closeFn, /setIsMailModal\(false\)/);
-    assert.match(closeFn, /navigate\("\/report\/1MwEuxLEkF"\)/);
-    assert.equal(closeFn.includes("sendEmailToSigners"), false);
+  it("extracted saveDocumentDetails commits SignedUrl and SentToOthers and opens the mail modal without sendmailv3", async () => {
+    const observed = await runInterruptedSendSequence();
+    assert.equal(observed.put.data.SentToOthers, true);
+    assert.equal(observed.put.data.SignedUrl, "https://files.example.test/doc.pdf");
+    assert.equal(observed.mailModalAfterSave, true);
+    assert.match(observed.put.url, /contracts_Document\/doc1/);
   });
 
-  it("reopening a draft that already has SignedUrl is treated as already dispatched", () => {
-    const state = classifyPlaceholderReopen([
-      {
-        SignedUrl: "https://files.example.test/doc.pdf",
-        IsCompleted: false,
-        IsDeclined: false,
-        ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" }
-      }
-    ]);
-    assert.deepEqual(state, { locked: true, reason: "already-dispatched" });
+  it("extracted CustomizeMail close navigates away without sending mail", () => {
+    const close = runCustomizeMailClose(customizeMailSrc);
+    assert.equal(close.state.isMailModal, false);
+    assert.equal(close.nav[0], "/report/1MwEuxLEkF");
   });
 
-  it("interrupted send leaves mailSent false while dispatch flags are true", () => {
-    const afterNext = {
-      SignedUrl: "https://files.example.test/doc.pdf",
-      SentToOthers: true,
-      mailSent: false
-    };
-    const afterClose = { ...afterNext, alreadyDispatchedUi: true };
-    assert.equal(afterClose.SentToOthers, true);
-    assert.equal(afterClose.mailSent, false);
-    const reopen = classifyPlaceholderReopen([
-      {
-        SignedUrl: afterClose.SignedUrl,
-        IsCompleted: false,
-        IsDeclined: false,
-        ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" }
-      }
-    ]);
-    assert.equal(reopen.reason, "already-dispatched");
+  it("extracted reopen after unsigned close is executable (baseline observation, not a lock gate)", async () => {
+    const observed = await runInterruptedSendSequence();
+    assert.ok(observed.put, "save PUT ran from extracted PlaceHolderSign source");
+    assert.equal(observed.close.nav[0], "/report/1MwEuxLEkF");
+    assert.ok(Array.isArray(observed.placed));
   });
 
   it("DocumentBeforesave stamps DocSentAt when SignedUrl first appears with signers", async () => {
@@ -113,24 +84,12 @@ describe("sender cancel-dialog / send-state recovery", () => {
     assert.equal(recorded[1], "count");
   });
 
-  it("RED: closing the send-mail dialog without Send must not lock the sender out of first invitation", () => {
-    const afterCloseWithoutSend = {
-      SignedUrl: "https://files.example.test/doc.pdf",
-      SentToOthers: true,
-      mailSent: false
-    };
-    const reopen = classifyPlaceholderReopen([
-      {
-        SignedUrl: afterCloseWithoutSend.SignedUrl,
-        IsCompleted: false,
-        IsDeclined: false,
-        ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" }
-      }
-    ]);
+  it("RED: extracted close-without-send then reopen must not lock the sender out of first invitation", async () => {
+    const observed = await runInterruptedSendSequence();
     assert.equal(
-      reopen.locked && afterCloseWithoutSend.mailSent === false,
+      isDispatchedLock(observed.placed),
       false,
-      "PlaceHolderSign treats SignedUrl as dispatched before sendmailv3; sender UI cannot recover the first invitation"
+      "PlaceHolderSign reopen treats SignedUrl as dispatched before sendmailv3"
     );
   });
 });

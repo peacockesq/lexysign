@@ -4,35 +4,60 @@ import { loadSourceModule, readRepoFile } from "./helpers/load-source-module.mjs
 import { createParseStub } from "./helpers/parse-stub.mjs";
 import { openSignSrc, serverSrc } from "./helpers/paths.mjs";
 
-function signerViewState(documentData, now = new Date("2026-09-15T12:00:00.000Z")) {
-  const isCompleted = documentData[0].IsCompleted && documentData[0].IsCompleted;
-  const expireDate = documentData[0]?.ExpiryDate?.iso;
-  const declined = documentData[0].IsDeclined && documentData[0].IsDeclined;
-  const expireUpdateDate = new Date(expireDate).getTime();
-  const currDate = now.getTime();
-  const pdfUrl = documentData[0].SignedUrl || documentData[0].URL;
-  if (isCompleted) return { pdfUrl, canSign: false, reason: "completed" };
-  if (declined) return { pdfUrl, canSign: false, reason: "declined" };
-  if (currDate > expireUpdateDate) return { pdfUrl, canSign: false, reason: "expired" };
-  return { pdfUrl, canSign: true, reason: "open" };
+const UTILS_STUB = {
+  appName: "LexySign",
+  brandColor: "#d46b0f",
+  brandEmailLogo: "<img/>",
+  cloudServerUrl: "http://localhost:8080/app",
+  serverAppId: "opensign"
+};
+
+function syntheticEnvelope(Parse, extra = {}) {
+  const doc = new Parse.Object("contracts_Document", {
+    IsEnableOTP: false,
+    Name: "synthetic-packet",
+    Placeholders: [
+      {
+        Role: "signer",
+        email: "alpha@example.test",
+        signerPtr: {
+          Name: "Alpha",
+          Email: "alpha@example.test",
+          UserId: { objectId: "user-1" }
+        }
+      }
+    ],
+    ExtUserPtr: {
+      objectId: "ext1",
+      Name: "Sender",
+      Email: "sender@example.test",
+      UserId: { objectId: "owner-1" }
+    },
+    ...extra
+  });
+  doc.id = extra.objectId || "doc-decline";
+  return doc;
+}
+
+function loadDecline(Parse, mail) {
+  return loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
+    stubs: {
+      axios: {
+        post: async (_url, params) => {
+          mail.push(params);
+          return { data: {} };
+        }
+      },
+      "../../Utils.js": UTILS_STUB
+    },
+    globals: { Parse, process }
+  });
 }
 
 describe("cancellation / decline checks", () => {
   it("declinedoc requires docId", async () => {
     const Parse = createParseStub();
-    const { exports } = loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
-      stubs: {
-        axios: { post: async () => ({}) },
-        "../../Utils.js": {
-          appName: "LexySign",
-          brandColor: "#d46b0f",
-          brandEmailLogo: "<img/>",
-          cloudServerUrl: "http://localhost:8080/app",
-          serverAppId: "opensign"
-        }
-      },
-      globals: { Parse, process }
-    });
+    const { exports } = loadDecline(Parse, []);
     await assert.rejects(
       () => exports.default({ params: {}, headers: {} }),
       (err) => {
@@ -43,58 +68,45 @@ describe("cancellation / decline checks", () => {
     );
   });
 
-  it("declines without OTP even when request.user is missing", async () => {
+  it("declines without OTP even when request.user is missing and sends owner mail", async () => {
     const Parse = createParseStub();
-    const doc = new Parse.Object("contracts_Document", {
-      IsEnableOTP: false,
-      Name: "synthetic",
-      Placeholders: [],
-      ExtUserPtr: { Name: "Sender", Email: "sender@example.test", objectId: "ext1" }
-    });
-    doc.id = "doc-decline";
+    const doc = syntheticEnvelope(Parse);
     Parse.records.contracts_Document = [doc];
     const mail = [];
-    const { exports } = loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
-      stubs: {
-        axios: { post: async (_url, params) => mail.push(params) },
-        "../../Utils.js": {
-          appName: "LexySign",
-          brandColor: "#d46b0f",
-          brandEmailLogo: "<img/>",
-          cloudServerUrl: "http://localhost:8080/app",
-          serverAppId: "opensign"
-        }
-      },
-      globals: { Parse, process }
-    });
-    const result = await exports.default({
-      params: { docId: "doc-decline", reason: "not signing", userId: "user-1" },
-      headers: { public_url: "https://sign.lexyalgo.com" }
-    });
-    assert.equal(result, "document declined");
-    assert.equal(doc.get("IsDeclined"), true);
-    assert.equal(doc.get("DeclineReason"), "not signing");
-    assert.equal(doc.get("DeclineBy").objectId, "user-1");
+    const errors = [];
+    const originalError = console.log;
+    console.log = (...args) => {
+      if (String(args[0]).includes("err in sendnotifymail")) errors.push(args);
+      else originalError(...args);
+    };
+    try {
+      const { exports } = loadDecline(Parse, mail);
+      const result = await exports.default({
+        params: { docId: "doc-decline", reason: "not signing", userId: "user-1" },
+        headers: { public_url: "https://sign.lexyalgo.com" }
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(result, "document declined");
+      assert.equal(doc.get("IsDeclined"), true);
+      assert.equal(doc.get("DeclineReason"), "not signing");
+      assert.equal(doc.get("DeclineBy").objectId, "user-1");
+      assert.equal(errors.length, 0, "sendDeclineMail must not swallow a TypeError");
+      assert.equal(mail.length, 1);
+      assert.equal(mail[0].recipient, "sender@example.test");
+      assert.match(mail[0].subject, /declined by Alpha/);
+      assert.match(mail[0].html, /not signing/);
+    } finally {
+      console.log = originalError;
+    }
   });
 
   it("OTP-enabled decline rejects an unauthenticated caller", async () => {
     const Parse = createParseStub();
-    const doc = new Parse.Object("contracts_Document", { IsEnableOTP: true });
+    const doc = syntheticEnvelope(Parse, { IsEnableOTP: true, objectId: "doc-otp" });
     doc.id = "doc-otp";
     Parse.records.contracts_Document = [doc];
-    const { exports } = loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
-      stubs: {
-        axios: { post: async () => ({}) },
-        "../../Utils.js": {
-          appName: "LexySign",
-          brandColor: "#d46b0f",
-          brandEmailLogo: "<img/>",
-          cloudServerUrl: "http://localhost:8080/app",
-          serverAppId: "opensign"
-        }
-      },
-      globals: { Parse, process }
-    });
+    const { exports } = loadDecline(Parse, []);
     await assert.rejects(
       () =>
         exports.default({
@@ -107,19 +119,19 @@ describe("cancellation / decline checks", () => {
     assert.equal(doc.get("IsDeclined"), undefined);
   });
 
-  it("signer UI still receives the PDF URL after decline (viewing is not revoked)", () => {
-    const state = signerViewState([
-      {
-        URL: "https://files.example.test/original.pdf",
-        SignedUrl: "https://files.example.test/partial.pdf",
-        IsDeclined: true,
-        IsCompleted: false,
-        ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" }
-      }
-    ]);
-    assert.equal(state.canSign, false);
-    assert.equal(state.reason, "declined");
-    assert.equal(state.pdfUrl, "https://files.example.test/partial.pdf");
+  it("PdfRequestFiles still assigns pdfUrl before the declined branch (viewing is not revoked)", () => {
+    const src = readRepoFile(openSignSrc("pages/PdfRequestFiles.jsx"));
+    const loadChunk = src.slice(
+      src.indexOf("if (documentData[0].SignedUrl)"),
+      src.indexOf("else if (isNextUser)")
+    );
+    assert.match(loadChunk, /setPdfUrl\(documentData\[0\]\.SignedUrl\)/);
+    assert.match(loadChunk, /setPdfUrl\(documentData\[0\]\.URL\)/);
+    assert.match(loadChunk, /else if \(declined\)/);
+    assert.match(loadChunk, /setIsDecline/);
+    const urlAssignIndex = loadChunk.indexOf("setPdfUrl");
+    const declineIndex = loadChunk.indexOf("else if (declined)");
+    assert.ok(urlAssignIndex >= 0 && urlAssignIndex < declineIndex);
   });
 
   it("PdfRequestFiles declineDoc posts declinedoc with docId, reason, and userId", () => {
@@ -133,28 +145,11 @@ describe("cancellation / decline checks", () => {
 
   it("RED: declinedocument should refuse an already completed envelope", async () => {
     const Parse = createParseStub();
-    const doc = new Parse.Object("contracts_Document", {
-      IsEnableOTP: false,
-      IsCompleted: true,
-      Name: "done",
-      Placeholders: [],
-      ExtUserPtr: { Name: "Sender", Email: "sender@example.test", objectId: "ext1" }
-    });
+    const doc = syntheticEnvelope(Parse, { IsCompleted: true, objectId: "doc-complete" });
     doc.id = "doc-complete";
     Parse.records.contracts_Document = [doc];
-    const { exports } = loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
-      stubs: {
-        axios: { post: async () => ({}) },
-        "../../Utils.js": {
-          appName: "LexySign",
-          brandColor: "#d46b0f",
-          brandEmailLogo: "<img/>",
-          cloudServerUrl: "http://localhost:8080/app",
-          serverAppId: "opensign"
-        }
-      },
-      globals: { Parse, process }
-    });
+    const mail = [];
+    const { exports } = loadDecline(Parse, mail);
     await assert.rejects(
       () =>
         exports.default({
@@ -163,5 +158,6 @@ describe("cancellation / decline checks", () => {
         }),
       /completed|already/i
     );
+    assert.equal(doc.get("IsDeclined"), undefined);
   });
 });

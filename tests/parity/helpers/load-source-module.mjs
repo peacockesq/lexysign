@@ -20,18 +20,18 @@ function rewriteImports(source) {
   return source.replace(
     /^[ \t]*import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"][ \t]*;?[ \t]*$/gm,
     (_match, bindings, spec) => {
-      const stubExpr = `globalThis.__moduleStubs[${JSON.stringify(spec)}]`;
+      const stubExpr = `globalThis.__requireStub(${JSON.stringify(spec)})`;
       const trimmed = bindings.trim();
       if (trimmed.startsWith("* as ")) {
         const name = trimmed.slice(5).trim();
-        return `const ${name} = ${stubExpr} || {};`;
+        return `const ${name} = ${stubExpr};`;
       }
       if (trimmed.startsWith("{")) {
-        return `const ${convertNamedImportBlock(trimmed)} = ${stubExpr} || {};`;
+        return `const ${convertNamedImportBlock(trimmed)} = ${stubExpr};`;
       }
       const defaultAndNamed = trimmed.match(/^([A-Za-z_$][\w$]*)\s*,\s*(\{[\s\S]*\})$/);
       if (defaultAndNamed) {
-        return `const ${defaultAndNamed[1]} = ${stubExpr};\nconst ${convertNamedImportBlock(defaultAndNamed[2])} = ${stubExpr} || {};`;
+        return `const ${defaultAndNamed[1]} = ${stubExpr};\nconst ${convertNamedImportBlock(defaultAndNamed[2])} = ${stubExpr};`;
       }
       return `const ${trimmed} = ${stubExpr};`;
     }
@@ -77,17 +77,15 @@ function rewriteExports(source) {
     }
   );
   next = next.replace(/export\s+\{([^}]+)\}/g, (_m, list) => {
-    const assigns = list
+    list
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean)
-      .map((item) => {
+      .forEach((item) => {
         const [local, alias] = item.split(/\s+as\s+/).map((s) => s.trim());
-        const exportedName = alias || local;
-        exported.push([exportedName, local]);
-        return "";
+        exported.push([alias || local, local]);
       });
-    return assigns.join("");
+    return "";
   });
   const trailer = exported
     .map(([key, value]) => `exports[${JSON.stringify(key)}] = ${value};`)
@@ -95,8 +93,11 @@ function rewriteExports(source) {
   return `${next}\n${trailer}\n`;
 }
 
-export function loadSourceModule(filePath, { stubs = {}, globals = {} } = {}) {
-  const original = fs.readFileSync(filePath, "utf8");
+export function loadSourceModule(
+  filePath,
+  { stubs = {}, globals = {}, sourceText } = {}
+) {
+  const original = sourceText ?? fs.readFileSync(filePath, "utf8");
   let source = original.replace(/^\uFEFF/, "");
   source = source.replace(/\bimport\.meta\.env\b/g, "globalThis.__importMetaEnv");
   source = source.replace(/\bimport\.meta\b/g, "globalThis.__importMeta");
@@ -126,6 +127,14 @@ export function loadSourceModule(filePath, { stubs = {}, globals = {} } = {}) {
   sandbox.window = globals.window || sandbox.window || sandbox;
   sandbox.document = globals.document || sandbox.document;
   sandbox.__moduleStubs = stubs;
+  sandbox.__requireStub = (spec) => {
+    if (!Object.prototype.hasOwnProperty.call(stubs, spec)) {
+      throw new Error(
+        `Missing module stub for ${JSON.stringify(spec)} while loading ${filePath}`
+      );
+    }
+    return stubs[spec];
+  };
   sandbox.__importMetaEnv = globals.importMetaEnv || {};
   sandbox.__importMeta = { env: sandbox.__importMetaEnv };
 

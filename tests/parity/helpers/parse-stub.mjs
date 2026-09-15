@@ -31,6 +31,9 @@ export function createParseStub({ records = {} } = {}) {
     increment(key, amount = 1) {
       this._attrs[key] = (this._attrs[key] || 0) + amount;
     }
+    toJSON() {
+      return { objectId: this.id, ...this._attrs };
+    }
     async save() {
       if (!this.id) this.id = `obj_${this.className}_${Math.random().toString(16).slice(2)}`;
       const list = records[this.className] || (records[this.className] = []);

@@ -6,43 +6,48 @@ Shared-edge / Caddyfile / Caddy networks / Caddy reload is a **separate explicit
 
 ## What the workflow does
 
-1. Pins image tags to `prod-<sha12>` or `staging-<sha12>` from the workflow `github.sha`. Arbitrary `image_tag` overrides are rejected.
+1. Pins image tags to `prod-<sha12>` or `staging-<sha12>` from the literal lowercase workflow SHA. Arbitrary `image_tag` overrides are rejected. Pulled image id + repo digest are resolved before `compose up`; a SHA-looking tag is not treated as immutable.
 2. Builds client and server from this revision. Frontend secrets are **not** Docker build-args. Host `.env` still supplies `VITE_SUPABASE_*` for `docker-entrypoint.lexysign.sh` runtime-env.js.
 3. Copies only `lexysign-app-release.py` to the host. It does not copy or overwrite `Caddyfile` or compose files.
-4. Staging preflight fails unless SMTP is the explicit local sink `mailpit` or `lexysign-staging-mailpit` on port `1025` with `SMTP_ENABLE=true`. SES, empty, default, and any other host are refused. No silent reroute.
-5. Staging preflight fails unless `.backup-manifest.json` points at existing non-empty `mongo_dump` and `files_backup` files.
-6. Writes target-only `.rollback-meta.json` (client/server image ids and revisions). **Replacing those images does not reverse Parse startup migrations.**
-7. `docker compose ... pull server` then `pull client`, then `up -d --no-deps --force-recreate server client`. No `--remove-orphans`, no Mongo recreate, no volume ops, no Caddy.
-8. Verifies running images and `org.opencontainers.image.revision` match the workflow SHA.
-9. HTTP smoke: `/` must be 2xx/3xx; `/api/billing/status` must be **401**. 5xx/unreachable is failure. Other billing codes are not success.
+4. Parses `docker compose config --format json` before mutation. Server/client must match target container names, project, pinned image, Mongo URI `mongodb://mongo:27017/lexysign`, files volume mount, and must not be privileged, host-networked, or mount a docker socket / shared-edge path.
+5. Staging mail is fail-closed on the **effective** compose server SMTP env, then on the live sink container: hostname `mailpit` or `lexysign-staging-mailpit`, port `1025`, shared app network, no relay/forwarding env. `.env` hostname allowlist alone is not enough.
+6. Staging **and** production require a backup manifest before replacement. Archives must be distinct regular non-symlink files under `{deploy_path}/backups/`, with SHA-256 + byte-count readback, gzip/mongodump `mdmp` magic, openable files tar, explicit `image_swap_reverts_schema: false`, timezone-aware ISO `created_at` within 24h, and source identity bound to the target project/mongo/volume/network. Non-empty junk is rejected. This is not a restore implementation.
+7. Original rollback metadata and prior `.deploy.env` / HOST_URL are written once under `.release-history/` and not overwritten on retry. Preflight/pull failure leaves `.deploy.env` unchanged.
+8. `pull server` then `pull client`, then `up -d --no-deps --force-recreate server client`. No `--remove-orphans`, no Mongo recreate, no Caddy.
+9. Post-up containers must be running, not restarting/dead/exited, healthy when a healthcheck exists, and their image id must match the pulled candidate.
+10. HTTP smoke: curl nonzero is failure even if the body/code prints 200/401. `/api/billing/status` must be unauthenticated 401.
 
-## Operator prep before staging app replacement
+## Operator prep (staging and production)
 
 Cain/operator, not this helper, must:
 
-1. Provision a local SMTP sink whose hostname is exactly `mailpit` or `lexysign-staging-mailpit`, SMTP port `1025`.
-2. Point `/opt/lexysign-staging/deploy/lexysign/.env` at that sink (`SMTP_HOST`, `SMTP_PORT=1025`, `SMTP_ENABLE=true`). Remove Amazon SES from staging. Do not leave production mail credentials as the staging default.
-3. Take a real mongodump of staging Mongo and an archive of the staging files volume. Empty files and `/dev/null` are rejected.
-4. Write `/opt/lexysign-staging/deploy/lexysign/.backup-manifest.json`:
+1. Staging only: provision Mailpit as `mailpit` or `lexysign-staging-mailpit` on the staging app network, SMTP `1025`, relay disabled. Point staging `.env` at that sink. Remove Amazon SES from staging. Effective compose env must resolve to the same sink.
+2. Take a real `mongodump --archive --gzip` of the **target** mongo container and a gzip tar of the **target** files volume. Store them under `/opt/lexysign[-staging]/backups/<stamp>/`.
+3. Write `{deploy}/.backup-manifest.json` (example staging):
 
 ```json
 {
   "environment": "staging",
-  "created_at": "2026-09-15T00:00:00Z",
-  "mongo_dump": "/opt/lexysign-staging/backups/<stamp>/mongo.archive",
+  "created_at": "2026-09-15T11:00:00Z",
+  "image_swap_reverts_schema": false,
+  "mongo_dump": "/opt/lexysign-staging/backups/<stamp>/mongo.archive.gz",
   "files_backup": "/opt/lexysign-staging/backups/<stamp>/files.tgz",
-  "image_swap_reverts_schema": false
+  "mongo_dump_sha256": "<sha256 of the gzip file>",
+  "mongo_dump_bytes": 12345,
+  "files_backup_sha256": "<sha256 of the tar.gz>",
+  "files_backup_bytes": 12345,
+  "source": {
+    "project_name": "lexysign-staging",
+    "mongo_container": "lexysign-staging-mongo",
+    "files_volume": "lexysign-staging_lexysign-files",
+    "network_name": "lexysign-staging_lexysign"
+  }
 }
 ```
 
-5. Keep host `.env` secrets in place. Do not paste them into GitHub Actions build-args.
+Production uses `lexysign` / `lexysign-mongo` / `lexysign_lexysign-files` / `lexysign_lexysign`. `created_at` must be timezone-aware ISO-8601 and not older than 24 hours (5-minute future skew allowed). Image swap does not restore schema; native restore of those archives is a separate gate.
 
-If the sink or backup manifest is missing, the helper exits with a clear error and does not mutate app containers.
-
-## Rollback
-
-- Client/server container image ids are in `.rollback-meta.json` for a **target-only** image retag/recreate.
-- That is not schema DR. Parse can migrate Mongo on startup. Restore `mongo_dump` and `files_backup` to undo data/schema mutation. Do not treat image swap as a database rollback.
+4. Keep host `.env` secrets in place. Do not inject `VITE_SUPABASE_*` as image build-args.
 
 ## Tests
 
@@ -50,4 +55,4 @@ If the sink or backup manifest is missing, the helper exits with a clear error a
 bash deploy/lexysign/tests/run-tests.sh
 ```
 
-Tests use a fake `docker`/`curl`/`timeout` environment. They do not talk to Docker, SSH, or the network.
+Tests use a fake `docker`/`curl`/`timeout` environment and a temp-root path prefix. They do not talk to Docker, SSH, or the network, and they cannot turn off production identity checks.

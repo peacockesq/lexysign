@@ -59,7 +59,7 @@ The deploy workflow refuses to deploy an environment if its `.env` is missing.
    - Hetzner app-only `compose pull` / `up -d --no-deps server client` (no shared Caddy copy/reload/networks, no `--remove-orphans`, no Mongo recreate);
    - public URL returns a non-5xx response;
    - `/api/billing/status` returns the expected unauthenticated `401` boundary (5xx/unreachable is a failed deploy, not success).
-   Shared Caddy/edge remains a separate explicit operation. Staging also requires a local SMTP sink and a real backup manifest before container replacement.
+   Shared Caddy/edge remains a separate explicit operation. Staging requires a local Mailpit sink. Staging and production both require a real backup manifest before app replacement.
 
 ## Emergency break-glass
 

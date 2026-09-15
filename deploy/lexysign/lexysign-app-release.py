@@ -12,13 +12,18 @@ helper does not inject frontend secrets and does not print env values.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -29,6 +34,13 @@ STAGING_SMTP_SINK_PORT = "1025"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TAG_RE = re.compile(r"^(prod|staging)-[0-9a-f]{12}$")
 SES_HINTS = ("amazonaws.com", "email-smtp.", "amazonses", "smtp.mailgun.org")
+RELAY_ENV_KEYS = (
+    "MP_SMTP_RELAY_HOST",
+    "MP_SMTP_RELAY_SERVER",
+    "MP_SMTP_RELAY",
+    "SMTP_RELAY_HOST",
+    "RELAY_HOST",
+)
 FORBIDDEN_DOCKER_TOKENS = (
     "caddy",
     "--remove-orphans",
@@ -37,6 +49,11 @@ FORBIDDEN_DOCKER_TOKENS = (
     "compose_profiles",
 )
 APP_SERVICES = frozenset({"server", "client"})
+MONGO_ARCHIVE_MAGIC = b"mdmp"
+BACKUP_MAX_AGE = timedelta(hours=24)
+BACKUP_FUTURE_SKEW = timedelta(minutes=5)
+FILES_MOUNT = "/usr/src/app/files"
+MONGO_URI = "mongodb://mongo:27017/lexysign"
 SECRET_ENV_KEYS = frozenset(
     {
         "MASTER_KEY",
@@ -67,6 +84,7 @@ EXPECTED = {
         "server_container": "lexysign-server",
         "mongo_container": "lexysign-mongo",
         "network_name": "lexysign_lexysign",
+        "files_volume": "lexysign_lexysign-files",
     },
     "staging": {
         "prefix": "staging",
@@ -77,6 +95,7 @@ EXPECTED = {
         "server_container": "lexysign-staging-server",
         "mongo_container": "lexysign-staging-mongo",
         "network_name": "lexysign-staging_lexysign",
+        "files_volume": "lexysign-staging_lexysign-files",
     },
 }
 
@@ -91,17 +110,24 @@ def eprint(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def is_test_mode() -> bool:
-    return os.environ.get("LEXYSIGN_APP_RELEASE_TEST", "") == "1"
+def utc_now_stamp() -> str:
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def expected_layout(target: str) -> dict[str, str]:
+    exp = dict(EXPECTED[target])
+    root = os.environ.get("LEXYSIGN_DEPLOY_ROOT", "").strip()
+    if root:
+        exp["deploy_path"] = str(Path(root) / Path(exp["deploy_path"]).relative_to("/"))
+    return exp
 
 
 def pinned_image_tag(target: str, github_sha: str) -> str:
-    prefix = EXPECTED[target]["prefix"]
-    return f"{prefix}-{github_sha[:12]}"
+    return f"{EXPECTED[target]['prefix']}-{github_sha[:12]}"
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -147,18 +173,14 @@ def upsert_env_key(path: Path, key: str, value: str) -> None:
 
 
 def load_config() -> dict[str, str]:
-    target = os.environ.get("TARGET", "").strip()
-    github_sha = os.environ.get("GITHUB_SHA", "").strip().lower()
-    image_tag = os.environ.get("IMAGE_TAG", "").strip()
-    deploy_path = os.environ.get("DEPLOY_PATH", "").strip()
-    cfg = {
-        "target": target,
-        "github_sha": github_sha,
+    return {
+        "target": os.environ.get("TARGET", "").strip(),
+        "github_sha": os.environ.get("GITHUB_SHA", "").strip(),
         "github_run_id": os.environ.get("GITHUB_RUN_ID", "manual").strip() or "manual",
-        "image_tag": image_tag,
+        "image_tag": os.environ.get("IMAGE_TAG", "").strip(),
         "public_url": os.environ.get("PUBLIC_URL", "").strip().rstrip("/"),
         "project_name": os.environ.get("PROJECT_NAME", "").strip(),
-        "deploy_path": deploy_path,
+        "deploy_path": os.environ.get("DEPLOY_PATH", "").strip(),
         "client_container": os.environ.get("CLIENT_CONTAINER", "").strip(),
         "server_container": os.environ.get("SERVER_CONTAINER", "").strip(),
         "mongo_container": os.environ.get("MONGO_CONTAINER", "").strip(),
@@ -166,8 +188,8 @@ def load_config() -> dict[str, str]:
         "registry": os.environ.get("REGISTRY", "ghcr.io").strip() or "ghcr.io",
         "image_owner": os.environ.get("IMAGE_OWNER", "peacockesq").strip() or "peacockesq",
         "compose_file": os.environ.get("LEXYSIGN_COMPOSE_FILE", "docker-compose.runtime.yml"),
+        "files_volume": os.environ.get("LEXYSIGN_FILES_VOLUME", "").strip(),
     }
-    return cfg
 
 
 def validate_inputs(cfg: Mapping[str, str]) -> None:
@@ -178,7 +200,11 @@ def validate_inputs(cfg: Mapping[str, str]) -> None:
         )
     sha = cfg["github_sha"]
     if not SHA_RE.match(sha):
-        raise ReleaseError("GITHUB_SHA must be the full 40-character lowercase hex revision", 21)
+        raise ReleaseError(
+            "GITHUB_SHA must be the literal 40-character lowercase hex revision; "
+            "malformed or case-folded source IDs are rejected",
+            21,
+        )
     expected_tag = pinned_image_tag(target, sha)
     if not TAG_RE.match(cfg["image_tag"]):
         raise ReleaseError(
@@ -191,43 +217,46 @@ def validate_inputs(cfg: Mapping[str, str]) -> None:
             f"{cfg['image_tag']!r}; deployed selection is pinned to workflow SHA tag {expected_tag}",
             21,
         )
-    expected = EXPECTED[target]
-    if not is_test_mode():
-        for key in (
-            "public_url",
-            "project_name",
-            "deploy_path",
-            "client_container",
-            "server_container",
-            "mongo_container",
-            "network_name",
-        ):
-            if cfg[key] != expected[key]:
-                raise ReleaseError(
-                    f"{key} {cfg[key]!r} does not match {target} expected {expected[key]!r}",
-                    21,
-                )
-    else:
-        for key in (
-            "public_url",
-            "project_name",
-            "deploy_path",
-            "client_container",
-            "server_container",
-            "mongo_container",
-        ):
-            if not cfg[key]:
-                raise ReleaseError(f"missing required {key}", 21)
-        if cfg["public_url"] != expected["public_url"]:
+    expected = expected_layout(target)
+    for key in (
+        "public_url",
+        "project_name",
+        "deploy_path",
+        "client_container",
+        "server_container",
+        "mongo_container",
+        "network_name",
+    ):
+        if cfg[key] != expected[key]:
             raise ReleaseError(
-                f"public_url {cfg['public_url']!r} does not match {target} expected {expected['public_url']!r}",
+                f"{key} {cfg[key]!r} does not match {target} expected {expected[key]!r}",
                 21,
             )
     if cfg["client_container"] == cfg["server_container"]:
         raise ReleaseError("client and server containers must be distinct", 21)
+    files_volume = cfg.get("files_volume") or expected["files_volume"]
+    if files_volume != expected["files_volume"]:
+        raise ReleaseError(
+            f"files_volume {files_volume!r} does not match {target} expected {expected['files_volume']!r}",
+            21,
+        )
 
 
-def staging_smtp_error(reason: str) -> ReleaseError:
+def env_map(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): "" if v is None else str(v) for k, v in raw.items()}
+    out: dict[str, str] = {}
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and "=" in item:
+                key, value = item.split("=", 1)
+                out[key] = value
+    return out
+
+
+def smtp_error(reason: str) -> ReleaseError:
     supported = ", ".join(sorted(STAGING_SMTP_SINK_HOSTS))
     return ReleaseError(
         "Staging mail sink is not prepared. "
@@ -245,33 +274,115 @@ def validate_staging_smtp(env_values: Mapping[str, str]) -> None:
     port = env_values.get("SMTP_PORT", "").strip()
     enable = env_values.get("SMTP_ENABLE", "").strip().lower()
     if not host:
-        raise staging_smtp_error("SMTP_HOST is missing or empty.")
+        raise smtp_error("SMTP_HOST is missing or empty.")
     host_l = host.lower()
     if any(hint in host_l for hint in SES_HINTS) or host_l.endswith(".amazonaws.com"):
-        raise staging_smtp_error(
+        raise smtp_error(
             f"SMTP_HOST {host!r} is a production SES/remote relay, not a local test sink."
         )
-    if host_l not in STAGING_SMTP_SINK_HOSTS:
-        raise staging_smtp_error(
+    if host not in STAGING_SMTP_SINK_HOSTS:
+        raise smtp_error(
             f"SMTP_HOST {host!r} is not a supported local test sink identity."
         )
     if port != STAGING_SMTP_SINK_PORT:
-        raise staging_smtp_error(
+        raise smtp_error(
             f"SMTP_PORT {port!r} does not match the supported local sink port {STAGING_SMTP_SINK_PORT}."
         )
     if enable not in {"true", "1", "yes"}:
-        raise staging_smtp_error(
+        raise smtp_error(
             f"SMTP_ENABLE={enable!r}; the local sink is present but not enabled."
         )
 
 
-def validate_backup_manifest(manifest_path: Path, target: str) -> dict[str, Any]:
+def sha256_and_size(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _parse_iso_aware(raw: str) -> datetime:
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ReleaseError(
+            f"backup manifest created_at {raw!r} is not an ISO-8601 timestamp", 23
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ReleaseError("backup manifest created_at must be timezone-aware", 23)
+    return parsed.astimezone(timezone.utc)
+
+
+def _require_regular_file(path: Path, backups_root: Path, label: str) -> None:
+    if not path.is_absolute():
+        raise ReleaseError(f"backup manifest {label} must be an absolute path", 23)
+    if not path.exists():
+        raise ReleaseError(f"backup manifest {label} is missing", 23)
+    if path.is_symlink() or stat.S_ISLNK(path.lstat().st_mode):
+        raise ReleaseError(f"backup manifest {label} must not be a symlink", 23)
+    if not path.is_file():
+        raise ReleaseError(f"backup manifest {label} is not a regular file", 23)
+    resolved = path.resolve()
+    root = backups_root.resolve()
+    if root not in resolved.parents and resolved != root:
+        raise ReleaseError(
+            f"backup manifest {label} must live under the protected backup directory {root}",
+            23,
+        )
+
+
+def _verify_mongo_gzip(path: Path) -> None:
+    header = path.read_bytes()[:2]
+    if header != b"\x1f\x8b":
+        raise ReleaseError("mongo_dump is not a gzip archive (missing gzip magic)", 23)
+    try:
+        with gzip.open(path, "rb") as handle:
+            magic = handle.read(4)
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise ReleaseError(
+            "mongo_dump gzip is truncated or not a valid gzip archive", 23
+        ) from exc
+    if magic != MONGO_ARCHIVE_MAGIC:
+        raise ReleaseError(
+            "mongo_dump decompressed header is not a mongodump archive (expected mdmp magic)",
+            23,
+        )
+
+
+def _verify_files_tar(path: Path) -> None:
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            members = [member for member in archive.getmembers() if member.isfile()]
+    except (OSError, tarfile.TarError) as exc:
+        raise ReleaseError("files_backup is not an openable tar/gzip archive", 23) from exc
+    if not members:
+        raise ReleaseError("files_backup tar contains no files", 23)
+
+
+def validate_backup_manifest(
+    manifest_path: Path,
+    cfg: Mapping[str, str],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    target = cfg["target"]
+    layout = expected_layout(target)
+    backups_root = Path(cfg["deploy_path"]) / "backups"
     if not manifest_path.is_file():
         raise ReleaseError(
             f"Missing backup manifest {manifest_path}. "
             "Native Parse startup migrations can mutate MongoDB; swapping the old app image "
-            "does not roll back schema. Create a real mongodump plus files-volume backup and "
-            "write the manifest before staging app replacement. This helper does not invent archives.",
+            "does not roll back schema. Create a real mongodump --archive --gzip plus files-volume "
+            "tar.gz under the protected backups directory before app replacement. "
+            "This helper does not invent archives or perform restore.",
             23,
         )
     try:
@@ -286,42 +397,72 @@ def validate_backup_manifest(manifest_path: Path, target: str) -> dict[str, Any]
             f"backup manifest environment {env_name!r} does not match TARGET {target}",
             23,
         )
-    if data.get("image_swap_reverts_schema") is True:
+    if "image_swap_reverts_schema" not in data or data.get("image_swap_reverts_schema") is not False:
         raise ReleaseError(
-            "backup manifest claims image_swap_reverts_schema=true; that is false. "
+            "backup manifest must set image_swap_reverts_schema to false. "
             "Parse/Mongo schema is not rolled back by replacing app images.",
             23,
         )
-    for key in ("mongo_dump", "files_backup"):
+    created = _parse_iso_aware(str(data.get("created_at", "")).strip())
+    clock = now or utc_now()
+    if created - clock > BACKUP_FUTURE_SKEW:
+        raise ReleaseError("backup manifest created_at is in the future", 23)
+    if clock - created > BACKUP_MAX_AGE:
+        raise ReleaseError(
+            "backup manifest is stale (created_at older than 24h freshness policy); "
+            "take a new mongodump and files archive before app replacement",
+            23,
+        )
+    source = data.get("source")
+    if not isinstance(source, dict):
+        raise ReleaseError("backup manifest missing source identity metadata", 23)
+    for key, expected in (
+        ("project_name", layout["project_name"]),
+        ("mongo_container", layout["mongo_container"]),
+        ("files_volume", layout["files_volume"]),
+        ("network_name", layout["network_name"]),
+    ):
+        if str(source.get(key, "")).strip() != expected:
+            raise ReleaseError(
+                f"backup manifest source.{key} does not match {target} identity {expected}",
+                23,
+            )
+    paths: dict[str, Path] = {}
+    for key, hash_key, size_key, verifier in (
+        ("mongo_dump", "mongo_dump_sha256", "mongo_dump_bytes", _verify_mongo_gzip),
+        ("files_backup", "files_backup_sha256", "files_backup_bytes", _verify_files_tar),
+    ):
         raw = data.get(key)
         if not isinstance(raw, str) or not raw.strip():
             raise ReleaseError(f"backup manifest missing {key} path", 23)
         path = Path(raw)
-        if not path.is_absolute():
-            raise ReleaseError(f"backup manifest {key} must be an absolute path", 23)
-        if not path.is_file() or path.stat().st_size <= 0:
-            raise ReleaseError(
-                f"backup manifest {key} {str(path)!r} is missing or empty; "
-                "refusing to mutate before a real database/files backup exists",
-                23,
-            )
-        if path.name in {os.devnull, "null"} or str(path) in {"/dev/null", "/dev/zero"}:
-            raise ReleaseError(f"backup manifest {key} is not a real archive", 23)
-    if str(data.get("mongo_dump")) == str(data.get("files_backup")):
+        _require_regular_file(path, backups_root, key)
+        if path.stat().st_size <= 0:
+            raise ReleaseError(f"backup manifest {key} is empty", 23)
+        digest, size = sha256_and_size(path)
+        claimed_hash = str(data.get(hash_key, "")).strip().lower()
+        if claimed_hash != digest:
+            raise ReleaseError(f"backup manifest {hash_key} does not match file readback", 23)
+        try:
+            claimed_size = int(data.get(size_key))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError(f"backup manifest {size_key} is missing or not an integer", 23) from exc
+        if claimed_size != size:
+            raise ReleaseError(f"backup manifest {size_key} does not match file readback", 23)
+        verifier(path)
+        paths[key] = path
+    if paths["mongo_dump"] == paths["files_backup"]:
         raise ReleaseError("backup manifest mongo_dump and files_backup must be distinct files", 23)
-    created_at = str(data.get("created_at", "")).strip()
-    if not created_at:
-        raise ReleaseError("backup manifest missing created_at", 23)
     return data
 
 
-def compose_base_args(cfg: Mapping[str, str]) -> list[str]:
+def compose_base_args(cfg: Mapping[str, str], deploy_env_file: str) -> list[str]:
     return [
         "compose",
         "--env-file",
         ".env",
         "--env-file",
-        ".deploy.env",
+        deploy_env_file,
         "-f",
         cfg["compose_file"],
     ]
@@ -329,6 +470,17 @@ def compose_base_args(cfg: Mapping[str, str]) -> list[str]:
 
 def _tokens(argv: Sequence[str]) -> list[str]:
     return [str(part) for part in argv]
+
+
+def expected_image(cfg: Mapping[str, str], name: str) -> str:
+    return f"{cfg['registry']}/{cfg['image_owner']}/lexysign-{name}:{cfg['image_tag']}"
+
+
+def allowed_inspect_names(cfg: Mapping[str, str]) -> set[str]:
+    names = {cfg["client_container"], cfg["server_container"]}
+    if cfg.get("target") == "staging":
+        names.update(STAGING_SMTP_SINK_HOSTS)
+    return names
 
 
 def assert_app_only_docker(argv: Sequence[str], cfg: Mapping[str, str]) -> None:
@@ -344,8 +496,6 @@ def assert_app_only_docker(argv: Sequence[str], cfg: Mapping[str, str]) -> None:
                 )
     if "caddy" in joined:
         raise ReleaseError(f"refusing Docker operation that references Caddy: {tokens}", 24)
-    if tokens[:1] == ["network"] or "network" in lowered[:3]:
-        raise ReleaseError("refusing docker network changes during app release", 24)
     if tokens[:1] == ["rm"] or (len(tokens) >= 2 and tokens[0] == "container" and tokens[1] == "rm"):
         raise ReleaseError("refusing docker rm during app release", 24)
     if tokens[:1] == ["exec"]:
@@ -354,16 +504,18 @@ def assert_app_only_docker(argv: Sequence[str], cfg: Mapping[str, str]) -> None:
         raise ReleaseError("refusing docker volume operations during app release", 24)
     if "--remove-orphans" in tokens:
         raise ReleaseError("refusing --remove-orphans", 24)
-    if "mongo" in lowered and "inspect" not in lowered:
+    if tokens[:1] == ["network"]:
+        raise ReleaseError("refusing docker network changes during app release", 24)
+    if "mongo" in lowered and "inspect" not in lowered and "config" not in lowered:
         raise ReleaseError(f"refusing Docker operation that targets mongo: {tokens}", 24)
 
     if tokens[:1] == ["inspect"]:
         names = [tok for tok in tokens[1:] if not tok.startswith("-")]
-        allowed = {cfg["client_container"], cfg["server_container"]}
+        allowed = allowed_inspect_names(cfg)
         for name in names:
             if name not in allowed:
                 raise ReleaseError(
-                    f"refusing inspect of non-app target {name!r}; app release is client/server only",
+                    f"refusing inspect of non-app/sink target {name!r}",
                     24,
                 )
         return
@@ -371,8 +523,19 @@ def assert_app_only_docker(argv: Sequence[str], cfg: Mapping[str, str]) -> None:
     if tokens[:1] == ["login"]:
         return
 
+    if tokens[:2] == ["image", "inspect"]:
+        refs = [tok for tok in tokens[2:] if not tok.startswith("-")]
+        allowed_refs = {expected_image(cfg, "client"), expected_image(cfg, "server")}
+        for ref in refs:
+            if ref not in allowed_refs:
+                raise ReleaseError(f"refusing image inspect of unexpected ref {ref!r}", 24)
+        return
+
     if tokens[:1] != ["compose"]:
         raise ReleaseError(f"refusing unexpected docker subcommand: {tokens}", 24)
+
+    if "config" in tokens:
+        return
 
     if "up" in tokens:
         if "--no-deps" not in tokens:
@@ -387,8 +550,6 @@ def assert_app_only_docker(argv: Sequence[str], cfg: Mapping[str, str]) -> None:
                 f"compose up is limited to server client; got {services}",
                 24,
             )
-        if "mongo" in services:
-            raise ReleaseError("compose up must not include mongo", 24)
         return
 
     if "pull" in tokens:
@@ -423,23 +584,17 @@ def run_docker(
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
-        detail = ""
-        if capture and result.stderr:
-            # Do not echo possible secret material; keep a short reason.
-            detail = f" (exit {result.returncode})"
         raise ReleaseError(
-            f"command failed: {' '.join(argv[:6])}...{detail}",
+            f"command failed: {' '.join(argv[:6])}... (exit {result.returncode})",
             25 if "inspect" in docker_argv else 1,
         )
     return result
 
 
 def docker_login() -> None:
-    if is_test_mode() or os.environ.get("LEXYSIGN_SKIP_DOCKER_LOGIN", "") == "1":
-        eprint("Skipping docker login (test/skip mode)")
-        return
     user = os.environ.get("LEXYSIGN_REGISTRY_USER", "").strip()
     token = os.environ.get("LEXYSIGN_REGISTRY_TOKEN", "").strip()
     if not user or not token:
@@ -464,6 +619,7 @@ def inspect_container(cfg: Mapping[str, str], name: str) -> dict[str, Any] | Non
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         return None
@@ -480,31 +636,86 @@ def container_meta(doc: Mapping[str, Any] | None) -> dict[str, Any]:
     if not doc:
         return {"missing": True}
     labels = (doc.get("Config") or {}).get("Labels") or {}
+    state = doc.get("State") or {}
+    mounts = doc.get("Mounts") or []
+    networks = list((doc.get("NetworkSettings") or {}).get("Networks") or {})
     return {
         "missing": False,
         "id": doc.get("Id"),
         "image": (doc.get("Config") or {}).get("Image"),
         "image_id": doc.get("Image"),
         "revision": labels.get("org.opencontainers.image.revision"),
+        "running": state.get("Running"),
+        "status": state.get("Status"),
+        "networks": networks,
+        "mount_destinations": [item.get("Destination") for item in mounts],
+        "volume_names": [item.get("Name") for item in mounts if item.get("Name")],
     }
 
 
-def capture_rollback_metadata(cfg: Mapping[str, str], dest: Path) -> dict[str, Any]:
+def history_dir(deploy_dir: Path) -> Path:
+    path = deploy_dir / ".release-history"
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
+    if path.exists():
+        return
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    os.replace(tmp, path)
+
+
+def preserve_original_state(cfg: Mapping[str, str], deploy_dir: Path) -> dict[str, Any]:
+    hist = history_dir(deploy_dir)
     payload = {
-        "captured_at": utc_now(),
+        "captured_at": utc_now_stamp(),
         "target": cfg["target"],
+        "github_sha": cfg["github_sha"],
         "warning": (
             "Image rollback does not revert Parse/Mongo schema migrations. "
-            "Restore mongo_dump and files_backup from the backup manifest to undo data/schema mutation."
+            "Restore mongo_dump and files_backup from the backup manifest to undo data/schema mutation. "
+            "Successful restore is a separate native gate; this file is not archive-only DR."
         ),
         "containers": {
             "client": container_meta(inspect_container(cfg, cfg["client_container"])),
             "server": container_meta(inspect_container(cfg, cfg["server_container"])),
         },
     }
-    dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    dest.chmod(0o600)
-    return payload
+    original = hist / "original-rollback.json"
+    write_json_once(original, payload)
+    public_meta = deploy_dir / ".rollback-meta.json"
+    write_json_once(public_meta, payload)
+    prior_env = hist / "original.deploy.env"
+    live_env = deploy_dir / ".deploy.env"
+    if live_env.is_file() and not prior_env.exists():
+        shutil.copy2(live_env, prior_env)
+        prior_env.chmod(0o600)
+    host_url_file = hist / "original.host_url"
+    if not host_url_file.exists():
+        env_values = parse_env_file(deploy_dir / ".env")
+        host_url_file.write_text(env_values.get("HOST_URL", "") + "\n", encoding="utf-8")
+        host_url_file.chmod(0o600)
+    return json.loads(original.read_text(encoding="utf-8"))
+
+
+def write_attempt_ledger(deploy_dir: Path, cfg: Mapping[str, str], phase: str) -> Path:
+    attempts = history_dir(deploy_dir) / "attempts"
+    attempts.mkdir(mode=0o700, exist_ok=True)
+    stamp = utc_now().strftime("%Y%m%dT%H%M%S")
+    path = attempts / f"{cfg['github_run_id']}-{stamp}-{phase}.json"
+    payload = {
+        "phase": phase,
+        "target": cfg["target"],
+        "github_sha": cfg["github_sha"],
+        "image_tag": cfg["image_tag"],
+        "captured_at": utc_now_stamp(),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def write_deploy_env(cfg: Mapping[str, str], dest: Path) -> None:
@@ -522,31 +733,236 @@ def write_deploy_env(cfg: Mapping[str, str], dest: Path) -> None:
     dest.chmod(0o600)
 
 
-def expected_image(cfg: Mapping[str, str], name: str) -> str:
-    return f"{cfg['registry']}/{cfg['image_owner']}/lexysign-{name}:{cfg['image_tag']}"
+def _volume_source(item: Any) -> str:
+    if isinstance(item, str):
+        return item.split(":", 1)[0]
+    if isinstance(item, dict):
+        return str(item.get("source") or item.get("Source") or item.get("Name") or "")
+    return ""
 
 
-def verify_running_images(cfg: Mapping[str, str]) -> None:
-    checks = (
-        ("client", cfg["client_container"]),
-        ("server", cfg["server_container"]),
-    )
-    for kind, name in checks:
+def _volume_target(item: Any) -> str:
+    if isinstance(item, str):
+        parts = item.split(":")
+        return parts[1] if len(parts) > 1 else ""
+    if isinstance(item, dict):
+        return str(item.get("target") or item.get("Target") or item.get("Destination") or "")
+    return ""
+
+
+def validate_compose_scope(cfg: Mapping[str, str], compose: Mapping[str, Any]) -> None:
+    if compose.get("name") != cfg["project_name"]:
+        raise ReleaseError(
+            f"compose project {compose.get('name')!r} does not match {cfg['project_name']}",
+            24,
+        )
+    services = compose.get("services") or {}
+    layout = expected_layout(cfg["target"])
+    for kind in ("server", "client"):
+        svc = services.get(kind) or {}
+        wanted_name = cfg[f"{kind}_container"]
+        if svc.get("container_name") != wanted_name:
+            raise ReleaseError(
+                f"compose {kind} container_name {svc.get('container_name')!r} is not {wanted_name}",
+                24,
+            )
+        image = str(svc.get("image") or "")
+        wanted_image = expected_image(cfg, kind)
+        if image != wanted_image and not image.startswith(
+            f"{cfg['registry']}/{cfg['image_owner']}/lexysign-{kind}@sha256:"
+        ):
+            raise ReleaseError(
+                f"compose {kind} image is not the pinned owner/tag or digest",
+                24,
+            )
+        if svc.get("privileged"):
+            raise ReleaseError(f"compose {kind} is privileged; refusing app release", 24)
+        network_mode = str(svc.get("network_mode") or "")
+        if network_mode in {"host", "service:caddy"} or network_mode.startswith("container:"):
+            raise ReleaseError(f"compose {kind} network_mode {network_mode!r} is not app-only", 24)
+        for volume in svc.get("volumes") or []:
+            source = _volume_source(volume).lower()
+            target = _volume_target(volume).lower()
+            blob = f"{source}:{target}"
+            if "docker.sock" in blob or "/etc/caddy" in blob or "caddyfile" in blob:
+                raise ReleaseError(
+                    f"compose {kind} has a shared-edge or docker socket mount; refusing",
+                    24,
+                )
+    server = services.get("server") or {}
+    server_env = env_map(server.get("environment"))
+    mongo_uri = server_env.get("MONGODB_URI") or server_env.get("DATABASE_URI") or ""
+    if mongo_uri != MONGO_URI:
+        raise ReleaseError("compose server DB destination is not mongodb://mongo:27017/lexysign", 24)
+    file_targets = [_volume_target(item) for item in server.get("volumes") or []]
+    if FILES_MOUNT not in file_targets:
+        raise ReleaseError("compose server is missing the persistent files mount", 24)
+    file_sources = [_volume_source(item) for item in server.get("volumes") or []]
+    if layout["files_volume"] not in file_sources and "lexysign-files" not in file_sources:
+        raise ReleaseError("compose server files volume identity does not match the target", 24)
+    server_nets = server.get("networks") or {}
+    if isinstance(server_nets, dict):
+        net_keys = set(server_nets)
+    else:
+        net_keys = set(server_nets)
+    if "lexysign" not in net_keys and cfg["network_name"] not in net_keys:
+        raise ReleaseError("compose server is not attached to the LexySign app network", 24)
+
+
+def validate_current_contract(cfg: Mapping[str, str]) -> None:
+    layout = expected_layout(cfg["target"])
+    for kind, name in (("client", cfg["client_container"]), ("server", cfg["server_container"])):
         doc = inspect_container(cfg, name)
         if not doc:
-            raise ReleaseError(f"{name} is not running after app release", 25)
+            raise ReleaseError(
+                f"{name} is missing; refuse to replace without a current target identity",
+                24,
+            )
         meta = container_meta(doc)
-        wanted = expected_image(cfg, kind)
-        if meta.get("image") != wanted:
+        host_cfg = doc.get("HostConfig") or {}
+        if host_cfg.get("Privileged"):
+            raise ReleaseError(f"{name} is privileged; refusing replacement", 24)
+        if host_cfg.get("NetworkMode") == "host":
+            raise ReleaseError(f"{name} uses host network; refusing replacement", 24)
+        if cfg["network_name"] not in (meta.get("networks") or []):
             raise ReleaseError(
-                f"{name} image {meta.get('image')!r} does not match pinned {wanted}",
+                f"{name} is not on expected network {cfg['network_name']}; mount/network drift",
+                24,
+            )
+        if kind == "server":
+            if FILES_MOUNT not in (meta.get("mount_destinations") or []):
+                raise ReleaseError(f"{name} is missing files mount {FILES_MOUNT}", 24)
+            volumes = meta.get("volume_names") or []
+            if layout["files_volume"] not in volumes:
+                raise ReleaseError(
+                    f"{name} files volume is not {layout['files_volume']}; refusing drift",
+                    24,
+                )
+
+
+def validate_effective_smtp(cfg: Mapping[str, str], compose: Mapping[str, Any]) -> str:
+    server_env = env_map((compose.get("services") or {}).get("server", {}).get("environment"))
+    validate_staging_smtp(server_env)
+    return server_env.get("SMTP_HOST", "").strip()
+
+
+def _port_open(doc: Mapping[str, Any], port: str) -> bool:
+    ports = (doc.get("NetworkSettings") or {}).get("Ports") or {}
+    exposed = (doc.get("Config") or {}).get("ExposedPorts") or {}
+    bindings = (doc.get("HostConfig") or {}).get("PortBindings") or {}
+    keys = {f"{port}/tcp", port}
+    return any(key in ports or key in exposed or key in bindings for key in keys)
+
+
+def validate_sink_container(cfg: Mapping[str, str], host: str) -> None:
+    doc = inspect_container(cfg, host)
+    if not doc:
+        raise smtp_error(f"local sink container {host!r} is not present.")
+    state = doc.get("State") or {}
+    if not state.get("Running") or state.get("Restarting") or state.get("Dead"):
+        raise smtp_error(f"local sink container {host!r} is not running.")
+    if not _port_open(doc, STAGING_SMTP_SINK_PORT):
+        raise smtp_error(f"local sink container {host!r} does not expose SMTP port {STAGING_SMTP_SINK_PORT}.")
+    networks = (doc.get("NetworkSettings") or {}).get("Networks") or {}
+    if cfg["network_name"] not in networks:
+        raise smtp_error(
+            f"local sink {host!r} is not on the staging app network {cfg['network_name']}."
+        )
+    env_values = env_map((doc.get("Config") or {}).get("Env"))
+    for key in RELAY_ENV_KEYS:
+        if env_values.get(key, "").strip():
+            raise smtp_error(
+                f"local sink {host!r} has relay/forwarding enabled; refusing (no SES/remote relay)."
+            )
+
+
+def resolve_pulled_candidates(cfg: Mapping[str, str]) -> dict[str, dict[str, str]]:
+    candidates: dict[str, dict[str, str]] = {}
+    for kind in ("server", "client"):
+        ref = expected_image(cfg, kind)
+        result = run_docker(cfg, ["image", "inspect", ref], capture=True)
+        try:
+            data = json.loads(result.stdout)[0]
+        except (json.JSONDecodeError, IndexError, TypeError) as exc:
+            raise ReleaseError(f"unable to inspect pulled {kind} image", 25) from exc
+        labels = (data.get("Config") or {}).get("Labels") or {}
+        revision = labels.get("org.opencontainers.image.revision")
+        environment = labels.get("com.lexysign.environment")
+        image_id = str(data.get("Id") or "")
+        digests = data.get("RepoDigests") or []
+        digest = str(digests[0]) if digests else ""
+        if revision != cfg["github_sha"]:
+            raise ReleaseError(
+                f"pulled {kind} revision does not match workflow SHA; refusing to replace running containers",
                 25,
             )
-        if meta.get("revision") != cfg["github_sha"]:
+        if environment != cfg["target"]:
             raise ReleaseError(
-                f"{name} revision {meta.get('revision')!r} does not match workflow SHA",
+                f"pulled {kind} environment label {environment!r} does not match {cfg['target']}",
                 25,
             )
+        if not image_id.startswith("sha256:"):
+            raise ReleaseError(f"pulled {kind} has no image id; a mutable tag is not a pin", 25)
+        if "@sha256:" not in digest:
+            raise ReleaseError(
+                f"pulled {kind} has no repo digest; refusing to treat a SHA-looking tag as immutable",
+                25,
+            )
+        candidates[kind] = {
+            "id": image_id,
+            "digest": digest,
+            "revision": revision,
+            "ref": ref,
+        }
+    return candidates
+
+
+def assert_live_app_container(
+    name: str,
+    doc: Mapping[str, Any] | None,
+    cfg: Mapping[str, str],
+    kind: str,
+    candidate: Mapping[str, str],
+) -> None:
+    if not doc:
+        raise ReleaseError(f"{name} is not present after app release", 25)
+    state = doc.get("State") or {}
+    status = str(state.get("Status") or "")
+    if not state.get("Running") or state.get("Restarting") or state.get("Dead"):
+        raise ReleaseError(
+            f"{name} is not running (status={status!r}); image/revision match is not enough",
+            25,
+        )
+    if status in {"exited", "dead", "paused", "restarting", "removing", "created"}:
+        raise ReleaseError(f"{name} status {status!r} is not a live app container", 25)
+    health = state.get("Health")
+    if isinstance(health, dict) and health:
+        if health.get("Status") != "healthy":
+            raise ReleaseError(
+                f"{name} healthcheck is {health.get('Status')!r}, not healthy",
+                25,
+            )
+    wanted = expected_image(cfg, kind)
+    config_image = (doc.get("Config") or {}).get("Image")
+    if config_image != wanted:
+        raise ReleaseError(
+            f"{name} image {config_image!r} does not match pinned {wanted}",
+            25,
+        )
+    if doc.get("Image") != candidate["id"]:
+        raise ReleaseError(
+            f"{name} image id does not match the pulled candidate digest/id",
+            25,
+        )
+    labels = (doc.get("Config") or {}).get("Labels") or {}
+    if labels.get("org.opencontainers.image.revision") != cfg["github_sha"]:
+        raise ReleaseError(f"{name} revision does not match workflow SHA", 25)
+
+
+def verify_running_images(cfg: Mapping[str, str], candidates: Mapping[str, Mapping[str, str]]) -> None:
+    for kind, name in (("client", cfg["client_container"]), ("server", cfg["server_container"])):
+        doc = inspect_container(cfg, name)
+        assert_live_app_container(name, doc, cfg, kind, candidates[kind])
 
 
 def http_retries() -> tuple[int, float, int]:
@@ -581,9 +997,9 @@ def curl_status(url: str, method: str, max_time: int) -> str:
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
     )
-    code = (result.stdout or "").strip()
-    if result.returncode != 0 and not code:
+    if result.returncode != 0:
         return "000"
+    code = (result.stdout or "").strip()
     if not re.fullmatch(r"[0-9]{3}", code):
         return "000"
     return code
@@ -609,7 +1025,7 @@ def smoke_http(public_url: str) -> None:
     home = wait_status(f"{origin}/", "HEAD", acceptable={"200", "301", "302", "303", "307", "308"}, retry_5xx=True)
     if home.startswith("5") or home == "000":
         raise ReleaseError(
-            f"app health failed for {origin}/: HTTP {home} (backend death or unreachable)",
+            f"app health failed for {origin}/: HTTP {home} (backend death, unreachable, or curl nonzero)",
             26,
         )
     if home != "200" and not home.startswith("3"):
@@ -625,7 +1041,7 @@ def smoke_http(public_url: str) -> None:
         return
     if billing.startswith("5") or billing == "000":
         raise ReleaseError(
-            f"billing/status failed: HTTP {billing} (backend death or unreachable, not the unauthenticated 401 boundary)",
+            f"billing/status failed: HTTP {billing} (backend death, unreachable, or curl nonzero; not the unauthenticated 401 boundary)",
             26,
         )
     raise ReleaseError(
@@ -643,8 +1059,25 @@ def up_timeout() -> int:
     return int(os.environ.get("LEXYSIGN_UP_TIMEOUT", "600"))
 
 
+def load_compose_config(cfg: Mapping[str, str], deploy_env_file: str) -> dict[str, Any]:
+    result = run_docker(
+        cfg,
+        [*compose_base_args(cfg, deploy_env_file), "config", "--format", "json"],
+        capture=True,
+    )
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("compose config --format json did not parse", 24) from exc
+    if not isinstance(data, dict):
+        raise ReleaseError("compose config JSON must be an object", 24)
+    return data
+
+
 def release(cfg: Mapping[str, str]) -> None:
     validate_inputs(cfg)
+    cfg = dict(cfg)
+    cfg["files_volume"] = expected_layout(cfg["target"])["files_volume"]
     deploy_dir = Path(cfg["deploy_path"]) / "deploy" / "lexysign"
     env_path = deploy_dir / ".env"
     if not env_path.is_file():
@@ -652,44 +1085,49 @@ def release(cfg: Mapping[str, str]) -> None:
             f"Missing {env_path}. Seed this file from production/staging secrets before deploying.",
             20,
         )
-    env_values = parse_env_file(env_path)
-
-    if cfg["target"] == "staging":
-        validate_staging_smtp(env_values)
-        manifest = Path(
-            os.environ.get(
-                "LEXYSIGN_BACKUP_MANIFEST",
-                str(deploy_dir / ".backup-manifest.json"),
-            )
+    parse_env_file(env_path)
+    manifest = Path(
+        os.environ.get(
+            "LEXYSIGN_BACKUP_MANIFEST",
+            str(deploy_dir / ".backup-manifest.json"),
         )
-        validate_backup_manifest(manifest, "staging")
+    )
+    validate_backup_manifest(manifest, cfg)
 
     os.chdir(deploy_dir)
-    rollback_path = Path(
-        os.environ.get("LEXYSIGN_ROLLBACK_META", str(deploy_dir / ".rollback-meta.json"))
-    )
-    capture_rollback_metadata(cfg, rollback_path)
-    eprint(f"Wrote target-only rollback metadata to {rollback_path}")
+    hist = history_dir(deploy_dir)
+    candidate_env = hist / f"{cfg['github_run_id']}.deploy.env.candidate"
+    write_deploy_env(cfg, candidate_env)
+    compose = load_compose_config(cfg, str(candidate_env))
+    validate_compose_scope(cfg, compose)
+    if cfg["target"] == "staging":
+        sink_host = validate_effective_smtp(cfg, compose)
+        validate_sink_container(cfg, sink_host)
+    validate_current_contract(cfg)
+    preserve_original_state(cfg, deploy_dir)
+    write_attempt_ledger(deploy_dir, cfg, "preflight")
     eprint(
         "Note: replacing client/server images does not reverse Parse startup migrations. "
-        "Use the backup manifest archives to restore data/schema."
+        "Use the backup manifest archives to restore data/schema. Restore is a separate native gate."
     )
-
-    upsert_env_key(env_path, "HOST_URL", cfg["public_url"])
-    write_deploy_env(cfg, deploy_dir / ".deploy.env")
 
     docker_login()
-    compose = compose_base_args(cfg)
     eprint(f"Pulling LexySign images for {cfg['target']} tag {cfg['image_tag']}")
-    run_docker(cfg, [*compose, "pull", "server"], timeout_secs=pull_timeout())
-    run_docker(cfg, [*compose, "pull", "client"], timeout_secs=pull_timeout())
+    run_docker(cfg, [*compose_base_args(cfg, str(candidate_env)), "pull", "server"], timeout_secs=pull_timeout())
+    run_docker(cfg, [*compose_base_args(cfg, str(candidate_env)), "pull", "client"], timeout_secs=pull_timeout())
+    candidates = resolve_pulled_candidates(cfg)
+    live_env = deploy_dir / ".deploy.env"
+    os.replace(candidate_env, live_env)
+    upsert_env_key(env_path, "HOST_URL", cfg["public_url"])
+    write_attempt_ledger(deploy_dir, cfg, "pulled")
     run_docker(
         cfg,
-        [*compose, "up", "-d", "--no-deps", "--force-recreate", "server", "client"],
+        [*compose_base_args(cfg, str(live_env)), "up", "-d", "--no-deps", "--force-recreate", "server", "client"],
         timeout_secs=up_timeout(),
     )
-    verify_running_images(cfg)
+    verify_running_images(cfg, candidates)
     smoke_http(cfg["public_url"])
+    write_attempt_ledger(deploy_dir, cfg, "complete")
     eprint(f"App-only release complete for {cfg['target']} at {cfg['image_tag']}")
 
 

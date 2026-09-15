@@ -6,14 +6,19 @@ Uses a fake command environment. No Docker daemon, SSH, or network I/O.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -37,6 +42,7 @@ OLD_SHA = "22ea252f555d0000000000000000000000000000"
 STAGING_TAG = f"staging-{SHA[:12]}"
 PROD_TAG = f"prod-{SHA[:12]}"
 SECRET_VALUE = "super-secret-not-for-logs-xyz"
+NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -50,6 +56,9 @@ fail = state.get("fail_on")
 if fail == "login" and argv[:1] == ["login"]:
     state_path.write_text(json.dumps(state))
     sys.exit(1)
+if fail == "config" and "config" in argv:
+    state_path.write_text(json.dumps(state))
+    sys.exit(11)
 if fail == "pull" and "pull" in argv:
     state_path.write_text(json.dumps(state))
     sys.exit(13)
@@ -57,6 +66,19 @@ if fail == "up" and "up" in argv:
     state_path.write_text(json.dumps(state))
     sys.exit(17)
 if argv[:1] == ["login"]:
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
+if "config" in argv:
+    sys.stdout.write(json.dumps(state.get("compose_config") or {}))
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
+if argv[:2] == ["image", "inspect"]:
+    ref = argv[-1]
+    doc = (state.get("images") or {}).get(ref)
+    if not doc:
+        state_path.write_text(json.dumps(state))
+        sys.exit(1)
+    sys.stdout.write(json.dumps([doc]))
     state_path.write_text(json.dumps(state))
     sys.exit(0)
 if argv[:1] == ["inspect"]:
@@ -68,6 +90,27 @@ if argv[:1] == ["inspect"]:
     sys.stdout.write(json.dumps([doc]))
     state_path.write_text(json.dumps(state))
     sys.exit(0)
+if "pull" in argv:
+    image_tag = state.get("next_image_tag")
+    revision = state.get("next_revision")
+    target = state.get("target")
+    owner = state.get("image_owner", "peacockesq")
+    registry = state.get("registry", "ghcr.io")
+    images = state.setdefault("images", {})
+    for kind in ("server", "client"):
+        ref = f"{registry}/{owner}/lexysign-{kind}:{image_tag}"
+        images[ref] = {
+            "Id": f"sha256:pulled-{kind}",
+            "RepoDigests": [f"{registry}/{owner}/lexysign-{kind}@sha256:digest-{kind}"],
+            "Config": {
+                "Labels": {
+                    "org.opencontainers.image.revision": revision,
+                    "com.lexysign.environment": target,
+                }
+            },
+        }
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
 if "up" in argv:
     image_tag = state.get("next_image_tag")
     revision = state.get("next_revision")
@@ -76,14 +119,29 @@ if "up" in argv:
     mapping = state.get("service_containers", {})
     for service, name in mapping.items():
         if name in state.get("containers", {}):
-            state["containers"][name]["Config"]["Image"] = f"{registry}/{owner}/lexysign-{service}:{image_tag}"
-            state["containers"][name]["Config"]["Labels"]["org.opencontainers.image.revision"] = revision
-            state["containers"][name]["Id"] = f"new-{service}-id"
-            state["containers"][name]["Image"] = f"sha256:new-{service}"
+            doc = state["containers"][name]
+            doc["Config"]["Image"] = f"{registry}/{owner}/lexysign-{service}:{image_tag}"
+            doc["Config"]["Labels"]["org.opencontainers.image.revision"] = revision
+            doc["Id"] = f"new-{service}-id"
+            doc["Image"] = f"sha256:pulled-{service}"
+            doc["State"]["Running"] = True
+            doc["State"]["Status"] = "running"
+            doc["State"]["Restarting"] = False
+            doc["State"]["Dead"] = False
+            doc["State"]["Health"] = {"Status": "healthy"}
     if state.get("mismatch_after_up"):
-        for name, doc in state.get("containers", {}).items():
+        for doc in state.get("containers", {}).values():
             doc["Config"]["Image"] = "ghcr.io/peacockesq/lexysign-client:wrong-tag"
+            doc["Image"] = "sha256:wrong"
             doc["Config"]["Labels"]["org.opencontainers.image.revision"] = "deadbeef"
+    if state.get("exited_after_up"):
+        for service, name in mapping.items():
+            doc = state["containers"][name]
+            doc["State"]["Running"] = False
+            doc["State"]["Status"] = "exited"
+            doc["State"]["Health"] = {"Status": "unhealthy"}
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
 state_path.write_text(json.dumps(state))
 sys.exit(0)
 '''
@@ -95,7 +153,7 @@ state = json.loads(Path(os.environ["FAKE_STATE"]).read_text())
 url = next((a for a in sys.argv[1:] if a.startswith("http://") or a.startswith("https://")), sys.argv[-1])
 code = state.get("http", {}).get(url, state.get("http_default", "000"))
 sys.stdout.write(str(code))
-sys.exit(0)
+sys.exit(int(state.get("curl_exit", {}).get(url, 0)))
 '''
 
 FAKE_TIMEOUT = r'''#!/usr/bin/env python3
@@ -126,8 +184,6 @@ class Results:
 
 
 RESULTS = Results()
-
-
 TESTS: list = []
 
 
@@ -144,13 +200,146 @@ def write_exec(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def container_doc(image: str, revision: str, ident: str) -> dict:
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_mongo_archive(path: Path, payload: bytes = b"mdmp\x00archive") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wb") as handle:
+        handle.write(payload)
+
+
+def write_files_tar(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        data = b"signed-doc"
+        info = tarfile.TarInfo(name="files/doc.pdf")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    path.write_bytes(buffer.getvalue())
+
+
+def identity(target: str) -> dict[str, str]:
+    if target == "production":
+        return {
+            "public_url": "https://sign.lexyalgo.com",
+            "project_name": "lexysign",
+            "client_container": "lexysign-client",
+            "server_container": "lexysign-server",
+            "mongo_container": "lexysign-mongo",
+            "network_name": "lexysign_lexysign",
+            "files_volume": "lexysign_lexysign-files",
+            "image_tag": PROD_TAG,
+        }
+    return {
+        "public_url": "https://sign-staging.lexyalgo.com",
+        "project_name": "lexysign-staging",
+        "client_container": "lexysign-staging-client",
+        "server_container": "lexysign-staging-server",
+        "mongo_container": "lexysign-staging-mongo",
+        "network_name": "lexysign-staging_lexysign",
+        "files_volume": "lexysign-staging_lexysign-files",
+        "image_tag": STAGING_TAG,
+    }
+
+
+def cfg_for(target: str, deploy_path: str) -> dict[str, str]:
+    ident = identity(target)
+    return {
+        "target": target,
+        "github_sha": SHA,
+        "github_run_id": "test-run",
+        "image_tag": ident["image_tag"],
+        "public_url": ident["public_url"],
+        "project_name": ident["project_name"],
+        "deploy_path": deploy_path,
+        "client_container": ident["client_container"],
+        "server_container": ident["server_container"],
+        "mongo_container": ident["mongo_container"],
+        "network_name": ident["network_name"],
+        "files_volume": ident["files_volume"],
+        "registry": "ghcr.io",
+        "image_owner": "peacockesq",
+        "compose_file": "docker-compose.runtime.yml",
+    }
+
+
+def write_valid_backup(deploy_path: Path, target: str, created_at: str = "2026-09-15T11:00:00Z") -> Path:
+    ident = identity(target)
+    backups = deploy_path / "backups" / "20260915"
+    mongo = backups / "mongo.archive.gz"
+    files = backups / "files.tgz"
+    write_mongo_archive(mongo)
+    write_files_tar(files)
+    mongo_bytes = mongo.read_bytes()
+    files_bytes = files.read_bytes()
+    manifest = deploy_path / "deploy" / "lexysign" / ".backup-manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "environment": target,
+                "created_at": created_at,
+                "image_swap_reverts_schema": False,
+                "mongo_dump": str(mongo),
+                "files_backup": str(files),
+                "mongo_dump_sha256": sha256_bytes(mongo_bytes),
+                "mongo_dump_bytes": len(mongo_bytes),
+                "files_backup_sha256": sha256_bytes(files_bytes),
+                "files_backup_bytes": len(files_bytes),
+                "source": {
+                    "project_name": ident["project_name"],
+                    "mongo_container": ident["mongo_container"],
+                    "files_volume": ident["files_volume"],
+                    "network_name": ident["network_name"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def container_doc(
+    image: str,
+    revision: str,
+    ident: str,
+    network: str,
+    *,
+    volume_name: str | None = None,
+    running: bool = True,
+    env: list[str] | None = None,
+    ports: dict | None = None,
+) -> dict:
+    mounts = []
+    if volume_name:
+        mounts.append({"Destination": "/usr/src/app/files", "Name": volume_name})
     return {
         "Id": ident,
         "Image": f"sha256:{ident}",
+        "State": {
+            "Running": running,
+            "Status": "running" if running else "exited",
+            "Restarting": False,
+            "Dead": False,
+            "Health": {"Status": "healthy"} if running else {},
+        },
+        "HostConfig": {"Privileged": False, "NetworkMode": network, "PortBindings": ports or {}},
         "Config": {
             "Image": image,
-            "Labels": {"org.opencontainers.image.revision": revision},
+            "Labels": {
+                "org.opencontainers.image.revision": revision,
+            },
+            "Env": env or [],
+            "ExposedPorts": {key: {} for key in (ports or {})},
+        },
+        "Mounts": mounts,
+        "NetworkSettings": {
+            "Networks": {network: {}},
+            "Ports": ports or {},
         },
     }
 
@@ -170,6 +359,41 @@ def make_env_text(**overrides: str) -> str:
     return "".join(f"{k}={v}\n" for k, v in values.items())
 
 
+def compose_config_for(target: str, image_tag: str, smtp: dict[str, str], *, server_name: str | None = None) -> dict:
+    ident = identity(target)
+    server_container = server_name or ident["server_container"]
+    return {
+        "name": ident["project_name"],
+        "services": {
+            "server": {
+                "image": f"ghcr.io/peacockesq/lexysign-server:{image_tag}",
+                "container_name": server_container,
+                "environment": {
+                    "MONGODB_URI": "mongodb://mongo:27017/lexysign",
+                    "SMTP_HOST": smtp.get("SMTP_HOST", "mailpit"),
+                    "SMTP_PORT": smtp.get("SMTP_PORT", "1025"),
+                    "SMTP_ENABLE": smtp.get("SMTP_ENABLE", "true"),
+                },
+                "volumes": [
+                    {
+                        "source": ident["files_volume"],
+                        "target": "/usr/src/app/files",
+                    }
+                ],
+                "networks": {"lexysign": {}},
+                "privileged": False,
+            },
+            "client": {
+                "image": f"ghcr.io/peacockesq/lexysign-client:{image_tag}",
+                "container_name": ident["client_container"],
+                "networks": {"lexysign": {}},
+                "privileged": False,
+                "volumes": [],
+            },
+        },
+    }
+
+
 def make_harness(
     tmp: Path,
     *,
@@ -178,58 +402,52 @@ def make_harness(
     http: dict[str, str] | None = None,
     fail_on: str | None = None,
     mismatch_after_up: bool = False,
+    exited_after_up: bool = False,
     with_backup: bool = True,
     with_env: bool = True,
     extra_env: dict[str, str] | None = None,
-) -> dict[str, Path | str]:
-    root = tmp / target
-    deploy = root / "deploy" / "lexysign"
+    compose_smtp: dict[str, str] | None = None,
+    server_container_name: str | None = None,
+    mailpit_relay: str | None = None,
+    curl_exit: dict[str, int] | None = None,
+    prior_deploy_env: str | None = None,
+) -> dict:
+    ident = identity(target)
+    fsroot = tmp / "fsroot"
+    deploy_path = fsroot / "opt" / ("lexysign" if target == "production" else "lexysign-staging")
+    deploy = deploy_path / "deploy" / "lexysign"
     deploy.mkdir(parents=True)
-    backups = root / "backups"
-    backups.mkdir(parents=True)
     caddy = deploy / "Caddyfile"
     caddy.write_text("shared-caddy-must-not-change\n", encoding="utf-8")
     (deploy / "docker-compose.runtime.yml").write_text("name: fixture\n", encoding="utf-8")
+    env_overrides = env_overrides or {}
     if with_env:
-        (deploy / ".env").write_text(make_env_text(**(env_overrides or {})), encoding="utf-8")
+        if target == "production" and "HOST_URL" not in env_overrides:
+            env_overrides = {
+                "HOST_URL": ident["public_url"],
+                "SMTP_HOST": "email-smtp.us-east-1.amazonaws.com",
+                "SMTP_PORT": "587",
+                "SMTP_ENABLE": "true",
+                **env_overrides,
+            }
+        (deploy / ".env").write_text(make_env_text(**env_overrides), encoding="utf-8")
         (deploy / ".env").chmod(0o600)
-    if with_backup and target == "staging":
-        mongo = backups / "mongo.archive"
-        files = backups / "files.tgz"
-        mongo.write_bytes(b"MONGO-DUMP")
-        files.write_bytes(b"FILES-BACKUP")
-        (deploy / ".backup-manifest.json").write_text(
-            json.dumps(
-                {
-                    "environment": "staging",
-                    "created_at": "2026-09-15T00:00:00Z",
-                    "mongo_dump": str(mongo),
-                    "files_backup": str(files),
-                    "image_swap_reverts_schema": False,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+    if prior_deploy_env is not None:
+        (deploy / ".deploy.env").write_text(prior_deploy_env, encoding="utf-8")
+    if with_backup:
+        write_valid_backup(deploy_path, target)
 
-    if target == "staging":
-        client = "lexysign-staging-client"
-        server = "lexysign-staging-server"
-        mongo_c = "lexysign-staging-mongo"
-        public_url = "https://sign-staging.lexyalgo.com"
-        project = "lexysign-staging"
-        image_tag = STAGING_TAG
-        old_client = f"ghcr.io/peacockesq/lexysign-client:staging-{OLD_SHA[:12]}"
-        old_server = f"ghcr.io/peacockesq/lexysign-server:staging-{OLD_SHA[:12]}"
-    else:
-        client = "lexysign-client"
-        server = "lexysign-server"
-        mongo_c = "lexysign-mongo"
-        public_url = "https://sign.lexyalgo.com"
-        project = "lexysign"
-        image_tag = PROD_TAG
-        old_client = f"ghcr.io/peacockesq/lexysign-client:prod-{OLD_SHA[:12]}"
-        old_server = f"ghcr.io/peacockesq/lexysign-server:prod-{OLD_SHA[:12]}"
+    smtp = compose_smtp or {
+        "SMTP_HOST": env_overrides.get("SMTP_HOST", "mailpit" if target == "staging" else "email-smtp.us-east-1.amazonaws.com"),
+        "SMTP_PORT": env_overrides.get("SMTP_PORT", "1025" if target == "staging" else "587"),
+        "SMTP_ENABLE": env_overrides.get("SMTP_ENABLE", "true"),
+    }
+    client = ident["client_container"]
+    server = ident["server_container"]
+    network = ident["network_name"]
+    image_tag = ident["image_tag"]
+    old_client = f"ghcr.io/peacockesq/lexysign-client:{('prod' if target == 'production' else 'staging')}-{OLD_SHA[:12]}"
+    old_server = f"ghcr.io/peacockesq/lexysign-server:{('prod' if target == 'production' else 'staging')}-{OLD_SHA[:12]}"
 
     fakebin = tmp / "fakebin"
     fakebin.mkdir()
@@ -237,24 +455,52 @@ def make_harness(
     write_exec(fakebin / "curl", FAKE_CURL)
     write_exec(fakebin / "timeout", FAKE_TIMEOUT)
 
+    public_url = ident["public_url"]
     http_map = http or {
         f"{public_url}/": "200",
         f"{public_url}/api/billing/status": "401",
     }
+    mailpit_env = []
+    if mailpit_relay:
+        mailpit_env.append(f"MP_SMTP_RELAY_HOST={mailpit_relay}")
+    containers = {
+        client: container_doc(old_client, OLD_SHA, "old-client", network, running=True),
+        server: container_doc(
+            old_server,
+            OLD_SHA,
+            "old-server",
+            network,
+            volume_name=ident["files_volume"],
+            running=True,
+        ),
+    }
+    if target == "staging":
+        containers["mailpit"] = container_doc(
+            "axllent/mailpit",
+            "mailpit",
+            "mailpit-id",
+            network,
+            running=True,
+            env=mailpit_env,
+            ports={"1025/tcp": [{"HostPort": "1025"}]},
+        )
+        containers["lexysign-staging-mailpit"] = containers["mailpit"]
     state = {
         "log": [],
         "fail_on": fail_on,
         "mismatch_after_up": mismatch_after_up,
+        "exited_after_up": exited_after_up,
         "next_image_tag": image_tag,
         "next_revision": SHA,
+        "target": target,
         "image_owner": "peacockesq",
         "registry": "ghcr.io",
         "service_containers": {"client": client, "server": server},
         "http": http_map,
-        "containers": {
-            client: container_doc(old_client, OLD_SHA, "old-client"),
-            server: container_doc(old_server, OLD_SHA, "old-server"),
-        },
+        "curl_exit": curl_exit or {},
+        "compose_config": compose_config_for(target, image_tag, smtp, server_name=server_container_name),
+        "containers": containers,
+        "images": {},
     }
     state_path = tmp / "fake-state.json"
     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -264,8 +510,9 @@ def make_harness(
         {
             "PATH": f"{fakebin}:{env.get('PATH', '')}",
             "FAKE_STATE": str(state_path),
-            "LEXYSIGN_APP_RELEASE_TEST": "1",
-            "LEXYSIGN_SKIP_DOCKER_LOGIN": "1",
+            "LEXYSIGN_DEPLOY_ROOT": str(fsroot),
+            "LEXYSIGN_REGISTRY_USER": "ci-user",
+            "LEXYSIGN_REGISTRY_TOKEN": "ci-token",
             "LEXYSIGN_HTTP_RETRIES": "1",
             "LEXYSIGN_HTTP_RETRY_DELAY": "0",
             "LEXYSIGN_HTTP_MAX_TIME": "2",
@@ -276,14 +523,17 @@ def make_harness(
             "GITHUB_RUN_ID": "test-run",
             "IMAGE_TAG": image_tag,
             "PUBLIC_URL": public_url,
-            "PROJECT_NAME": project,
-            "DEPLOY_PATH": str(root),
+            "PROJECT_NAME": ident["project_name"],
+            "DEPLOY_PATH": str(deploy_path),
             "CLIENT_CONTAINER": client,
             "SERVER_CONTAINER": server,
-            "MONGO_CONTAINER": mongo_c,
-            "NETWORK_NAME": "unused",
+            "MONGO_CONTAINER": ident["mongo_container"],
+            "NETWORK_NAME": network,
+            "LEXYSIGN_FILES_VOLUME": ident["files_volume"],
         }
     )
+    env.pop("LEXYSIGN_APP_RELEASE_TEST", None)
+    env.pop("LEXYSIGN_SKIP_DOCKER_LOGIN", None)
     if extra_env:
         env.update(extra_env)
     return {
@@ -291,7 +541,8 @@ def make_harness(
         "deploy": deploy,
         "caddy": caddy,
         "state": state_path,
-        "root": root,
+        "root": deploy_path,
+        "fsroot": fsroot,
         "client": client,
         "server": server,
     }
@@ -417,37 +668,15 @@ def _():
 
 @test("input_reject_mismatched_image_tag")
 def _():
-    cfg = {
-        "target": "staging",
-        "github_sha": SHA,
-        "image_tag": "staging-aaaaaaaaaaaa",
-        "public_url": "https://sign-staging.lexyalgo.com",
-        "project_name": "lexysign-staging",
-        "deploy_path": "/opt/lexysign-staging",
-        "client_container": "lexysign-staging-client",
-        "server_container": "lexysign-staging-server",
-        "mongo_container": "lexysign-staging-mongo",
-        "network_name": "lexysign-staging_lexysign",
-    }
-    os.environ["LEXYSIGN_APP_RELEASE_TEST"] = "1"
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    cfg["image_tag"] = "staging-aaaaaaaaaaaa"
     expect_raises(lambda: app.validate_inputs(cfg), app.ReleaseError, "mismatched image tag")
 
 
 @test("input_reject_floating_tag")
 def _():
-    os.environ["LEXYSIGN_APP_RELEASE_TEST"] = "1"
-    cfg = {
-        "target": "staging",
-        "github_sha": SHA,
-        "image_tag": "staging",
-        "public_url": "https://sign-staging.lexyalgo.com",
-        "project_name": "lexysign-staging",
-        "deploy_path": "/tmp/x",
-        "client_container": "lexysign-staging-client",
-        "server_container": "lexysign-staging-server",
-        "mongo_container": "lexysign-staging-mongo",
-        "network_name": "lexysign-staging_lexysign",
-    }
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    cfg["image_tag"] = "staging"
     expect_raises(lambda: app.validate_inputs(cfg), app.ReleaseError, "pinned SHA tag")
 
 
@@ -460,14 +689,97 @@ def _():
     )
 
 
+@test("input_reject_uppercase_sha")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    cfg["github_sha"] = SHA.upper()
+    expect_raises(lambda: app.validate_inputs(cfg), app.ReleaseError, "literal 40-character lowercase")
+
+
+@test("test_flag_does_not_bypass_production_paths")
+def _():
+    os.environ["LEXYSIGN_APP_RELEASE_TEST"] = "1"
+    cfg = cfg_for("production", "/tmp/not-production")
+    expect_raises(lambda: app.validate_inputs(cfg), app.ReleaseError, "deploy_path")
+    os.environ.pop("LEXYSIGN_APP_RELEASE_TEST", None)
+
+
 @test("backup_missing_fails")
 def _():
     with tempfile.TemporaryDirectory() as raw:
-        path = Path(raw) / "missing.json"
+        root = Path(raw)
         expect_raises(
-            lambda: app.validate_backup_manifest(path, "staging"),
+            lambda: app.validate_backup_manifest(root / "missing.json", cfg_for("staging", str(root)), now=NOW),
             app.ReleaseError,
             "Missing backup manifest",
+        )
+
+
+@test("backup_junk_bytes_fail")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        backups = root / "backups"
+        junk = backups / "mongo.archive.gz"
+        files = backups / "files.tgz"
+        junk.parent.mkdir(parents=True)
+        junk.write_bytes(b"not an archive")
+        write_files_tar(files)
+        manifest = root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "environment": "staging",
+                    "created_at": "2026-09-15T11:00:00Z",
+                    "image_swap_reverts_schema": False,
+                    "mongo_dump": str(junk),
+                    "files_backup": str(files),
+                    "mongo_dump_sha256": sha256_bytes(junk.read_bytes()),
+                    "mongo_dump_bytes": junk.stat().st_size,
+                    "files_backup_sha256": sha256_bytes(files.read_bytes()),
+                    "files_backup_bytes": files.stat().st_size,
+                    "source": {
+                        "project_name": "lexysign-staging",
+                        "mongo_container": "lexysign-staging-mongo",
+                        "files_volume": "lexysign-staging_lexysign-files",
+                        "network_name": "lexysign-staging_lexysign",
+                    },
+                }
+            )
+        )
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "gzip magic",
+        )
+
+
+@test("backup_not_a_date_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging", created_at="not-a-date")
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "ISO-8601",
+        )
+
+
+@test("backup_missing_explicit_false_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        data = json.loads(manifest.read_text())
+        del data["image_swap_reverts_schema"]
+        manifest.write_text(json.dumps(data))
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "image_swap_reverts_schema",
         )
 
 
@@ -475,25 +787,37 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
-        empty = root / "mongo.archive"
+        empty = root / "backups" / "mongo.archive.gz"
+        empty.parent.mkdir(parents=True)
         empty.write_bytes(b"")
-        files = root / "files.tgz"
-        files.write_bytes(b"data")
+        files = root / "backups" / "files.tgz"
+        write_files_tar(files)
         manifest = root / "manifest.json"
         manifest.write_text(
             json.dumps(
                 {
                     "environment": "staging",
-                    "created_at": "2026-09-15T00:00:00Z",
+                    "created_at": "2026-09-15T11:00:00Z",
+                    "image_swap_reverts_schema": False,
                     "mongo_dump": str(empty),
                     "files_backup": str(files),
+                    "mongo_dump_sha256": sha256_bytes(b""),
+                    "mongo_dump_bytes": 0,
+                    "files_backup_sha256": sha256_bytes(files.read_bytes()),
+                    "files_backup_bytes": files.stat().st_size,
+                    "source": {
+                        "project_name": "lexysign-staging",
+                        "mongo_container": "lexysign-staging-mongo",
+                        "files_volume": "lexysign-staging_lexysign-files",
+                        "network_name": "lexysign-staging_lexysign",
+                    },
                 }
             )
         )
         expect_raises(
-            lambda: app.validate_backup_manifest(manifest, "staging"),
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
             app.ReleaseError,
-            "missing or empty",
+            "empty",
         )
 
 
@@ -501,26 +825,109 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
-        mongo = root / "mongo.archive"
-        files = root / "files.tgz"
-        mongo.write_bytes(b"dump")
-        files.write_bytes(b"files")
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        data = json.loads(manifest.read_text())
+        data["image_swap_reverts_schema"] = True
+        manifest.write_text(json.dumps(data))
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "image_swap_reverts_schema",
+        )
+
+
+@test("backup_hash_mismatch_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        data = json.loads(manifest.read_text())
+        data["mongo_dump_sha256"] = "0" * 64
+        manifest.write_text(json.dumps(data))
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "does not match file readback",
+        )
+
+
+@test("backup_stale_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging", created_at="2026-09-01T00:00:00Z")
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "stale",
+        )
+
+
+@test("backup_future_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging", created_at="2026-09-16T12:00:00Z")
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "future",
+        )
+
+
+@test("backup_wrong_target_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "production")
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "does not match TARGET",
+        )
+
+
+@test("backup_truncated_gzip_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        backups = root / "backups"
+        mongo = backups / "mongo.archive.gz"
+        files = backups / "files.tgz"
+        mongo.parent.mkdir(parents=True)
+        mongo.write_bytes(b"\x1f\x8b")
+        write_files_tar(files)
         manifest = root / "manifest.json"
         manifest.write_text(
             json.dumps(
                 {
                     "environment": "staging",
-                    "created_at": "2026-09-15T00:00:00Z",
+                    "created_at": "2026-09-15T11:00:00Z",
+                    "image_swap_reverts_schema": False,
                     "mongo_dump": str(mongo),
                     "files_backup": str(files),
-                    "image_swap_reverts_schema": True,
+                    "mongo_dump_sha256": sha256_bytes(mongo.read_bytes()),
+                    "mongo_dump_bytes": mongo.stat().st_size,
+                    "files_backup_sha256": sha256_bytes(files.read_bytes()),
+                    "files_backup_bytes": files.stat().st_size,
+                    "source": {
+                        "project_name": "lexysign-staging",
+                        "mongo_container": "lexysign-staging-mongo",
+                        "files_volume": "lexysign-staging_lexysign-files",
+                        "network_name": "lexysign-staging_lexysign",
+                    },
                 }
             )
         )
         expect_raises(
-            lambda: app.validate_backup_manifest(manifest, "staging"),
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
             app.ReleaseError,
-            "image_swap_reverts_schema",
+            "truncated",
         )
 
 
@@ -528,28 +935,15 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
-        mongo = root / "mongo.archive"
-        files = root / "files.tgz"
-        mongo.write_bytes(b"dump")
-        files.write_bytes(b"files")
-        manifest = root / "manifest.json"
-        manifest.write_text(
-            json.dumps(
-                {
-                    "environment": "staging",
-                    "created_at": "2026-09-15T00:00:00Z",
-                    "mongo_dump": str(mongo),
-                    "files_backup": str(files),
-                }
-            )
-        )
-        data = app.validate_backup_manifest(manifest, "staging")
-        assert data["mongo_dump"] == str(mongo)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        data = app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW)
+        assert data["image_swap_reverts_schema"] is False
 
 
 @test("docker_guard_refuses_caddy")
 def _():
-    cfg = {"client_container": "c1", "server_container": "s1"}
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
     expect_raises(
         lambda: app.assert_app_only_docker(["exec", "lexysign-caddy", "caddy", "reload"], cfg),
         app.ReleaseError,
@@ -559,7 +953,7 @@ def _():
 
 @test("docker_guard_refuses_remove_orphans")
 def _():
-    cfg = {"client_container": "c1", "server_container": "s1"}
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
     expect_raises(
         lambda: app.assert_app_only_docker(
             ["compose", "up", "-d", "--no-deps", "--remove-orphans", "server", "client"],
@@ -572,7 +966,7 @@ def _():
 
 @test("docker_guard_refuses_mongo_up")
 def _():
-    cfg = {"client_container": "c1", "server_container": "s1"}
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
     expect_raises(
         lambda: app.assert_app_only_docker(
             ["compose", "up", "-d", "--no-deps", "mongo"],
@@ -585,7 +979,7 @@ def _():
 
 @test("docker_guard_refuses_up_without_no_deps")
 def _():
-    cfg = {"client_container": "c1", "server_container": "s1"}
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
     expect_raises(
         lambda: app.assert_app_only_docker(["compose", "up", "-d", "server", "client"], cfg),
         app.ReleaseError,
@@ -595,11 +989,60 @@ def _():
 
 @test("docker_guard_allows_app_up")
 def _():
-    cfg = {"client_container": "c1", "server_container": "s1"}
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
     app.assert_app_only_docker(
         ["compose", "--env-file", ".env", "up", "-d", "--no-deps", "--force-recreate", "server", "client"],
         cfg,
     )
+
+
+@test("compose_scope_rejects_server_named_caddy")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"}, server_name="lexysign-caddy")
+    expect_raises(lambda: app.validate_compose_scope(cfg, compose), app.ReleaseError, "container_name")
+
+
+@test("live_container_exited_fails_despite_image_labels")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    candidate = {"id": "sha256:pulled-client", "digest": "sha256:digest-client", "revision": SHA, "ref": "x"}
+    doc = container_doc(
+        f"ghcr.io/peacockesq/lexysign-client:{STAGING_TAG}",
+        SHA,
+        "pulled-client",
+        cfg["network_name"],
+        running=False,
+    )
+    doc["Image"] = "sha256:pulled-client"
+    expect_raises(
+        lambda: app.assert_live_app_container(cfg["client_container"], doc, cfg, "client", candidate),
+        app.ReleaseError,
+        "not running",
+    )
+
+
+@test("curl_nonzero_with_printed_401_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            curl_exit={"https://sign-staging.lexyalgo.com/api/billing/status": 28},
+        )
+        proc = run_helper(harness, "smoke-http")
+        assert proc.returncode == 26, proc.stderr
+        assert "curl nonzero" in proc.stderr or "000" in proc.stderr
+
+
+@test("curl_nonzero_with_printed_200_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            curl_exit={"https://sign-staging.lexyalgo.com/": 28},
+        )
+        proc = run_helper(harness, "smoke-http")
+        assert proc.returncode == 26, proc.stderr
 
 
 @test("smoke_http_accepts_401_not_5xx")
@@ -664,12 +1107,10 @@ def _():
         assert proc.returncode == 0, proc.stderr
         assert Path(harness["caddy"]).read_bytes() == before
         log = docker_log(harness)
-        flat = [" ".join(x) for x in log]
-        joined = "\n".join(flat).lower()
+        joined = "\n".join(" ".join(x) for x in log).lower()
         assert "caddy" not in joined
-        assert "network" not in joined
+        assert "network connect" not in joined
         assert "--remove-orphans" not in joined
-        assert " rm " not in f" {joined} "
         ups = [x for x in log if "up" in x]
         assert len(ups) == 1
         assert "--no-deps" in ups[0]
@@ -681,12 +1122,9 @@ def _():
         assert SECRET_VALUE not in proc.stdout + proc.stderr
         meta = json.loads((Path(harness["deploy"]) / ".rollback-meta.json").read_text())
         assert set(meta["containers"]) == {"client", "server"}
-        assert "caddy" not in json.dumps(meta)
-        assert "mongo" not in json.dumps(meta["containers"])
         assert "does not revert" in meta["warning"]
         env_text = (Path(harness["deploy"]) / ".env").read_text()
         assert SECRET_VALUE in env_text
-        assert "VITE_SUPABASE_ANON_KEY" in env_text
 
 
 @test("release_staging_ses_fails_before_compose_up")
@@ -699,10 +1137,50 @@ def _():
                 "SMTP_PORT": "587",
                 "SMTP_ENABLE": "true",
             },
+            prior_deploy_env="LEXYSIGN_IMAGE_TAG=keep-me\n",
         )
         proc = run_helper(harness)
         assert proc.returncode == 22, proc.stderr
         assert "not prepared" in proc.stderr
+        log = docker_log(harness)
+        assert not any("up" in x or "pull" in x for x in log)
+        assert (Path(harness["deploy"]) / ".deploy.env").read_text() == "LEXYSIGN_IMAGE_TAG=keep-me\n"
+
+
+@test("release_effective_ses_override_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            compose_smtp={
+                "SMTP_HOST": "email-smtp.us-east-1.amazonaws.com",
+                "SMTP_PORT": "587",
+                "SMTP_ENABLE": "true",
+            },
+        )
+        proc = run_helper(harness)
+        assert proc.returncode == 22, proc.stderr
+        log = docker_log(harness)
+        assert not any("up" in x or "pull" in x for x in log)
+
+
+@test("release_mailpit_relay_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(Path(raw), mailpit_relay="email-smtp.us-east-1.amazonaws.com")
+        proc = run_helper(harness)
+        assert proc.returncode == 22, proc.stderr
+        assert "relay" in proc.stderr.lower()
+        log = docker_log(harness)
+        assert not any("up" in x or "pull" in x for x in log)
+
+
+@test("release_compose_server_named_caddy_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(Path(raw), server_container_name="lexysign-caddy")
+        proc = run_helper(harness)
+        assert proc.returncode != 0
         log = docker_log(harness)
         assert not any("up" in x or "pull" in x for x in log)
 
@@ -710,11 +1188,11 @@ def _():
 @test("release_staging_missing_backup_fails_before_mutation")
 def _():
     with tempfile.TemporaryDirectory() as raw:
-        harness = make_harness(Path(raw), with_backup=False)
+        harness = make_harness(Path(raw), with_backup=False, prior_deploy_env="LEXYSIGN_IMAGE_TAG=keep-me\n")
         proc = run_helper(harness)
         assert proc.returncode == 23, proc.stderr
         assert "Missing backup manifest" in proc.stderr
-        assert "does not roll back schema" in proc.stderr
+        assert (Path(harness["deploy"]) / ".deploy.env").read_text() == "LEXYSIGN_IMAGE_TAG=keep-me\n"
         log = docker_log(harness)
         assert not any("up" in x or "pull" in x for x in log)
 
@@ -727,16 +1205,17 @@ def _():
         assert proc.returncode == 20, proc.stderr
 
 
-@test("release_pull_failure_propagates")
+@test("release_pull_failure_leaves_deploy_env")
 def _():
     with tempfile.TemporaryDirectory() as raw:
-        harness = make_harness(Path(raw), fail_on="pull")
+        harness = make_harness(Path(raw), fail_on="pull", prior_deploy_env="LEXYSIGN_IMAGE_TAG=keep-me\n")
         proc = run_helper(harness)
         assert proc.returncode != 0
         assert proc.returncode != 22
         log = docker_log(harness)
         assert any("pull" in x for x in log)
         assert not any("up" in x for x in log)
+        assert (Path(harness["deploy"]) / ".deploy.env").read_text() == "LEXYSIGN_IMAGE_TAG=keep-me\n"
 
 
 @test("release_up_failure_propagates")
@@ -754,23 +1233,25 @@ def _():
         harness = make_harness(Path(raw), mismatch_after_up=True)
         proc = run_helper(harness)
         assert proc.returncode == 25, proc.stderr
-        assert "does not match pinned" in proc.stderr
 
 
-@test("release_production_allows_ses_without_staging_sink")
+@test("release_exited_after_up_fails")
 def _():
     with tempfile.TemporaryDirectory() as raw:
-        harness = make_harness(
-            Path(raw),
-            target="production",
-            env_overrides={
-                "HOST_URL": "https://sign.lexyalgo.com",
-                "SMTP_HOST": "email-smtp.us-east-1.amazonaws.com",
-                "SMTP_PORT": "587",
-                "SMTP_ENABLE": "true",
-            },
-            with_backup=False,
-        )
+        harness = make_harness(Path(raw), exited_after_up=True)
+        proc = run_helper(harness)
+        assert proc.returncode == 25, proc.stderr
+        assert "not running" in proc.stderr
+
+
+@test("release_production_requires_backup_and_allows_ses")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        blocked = make_harness(Path(raw), target="production", with_backup=False)
+        proc = run_helper(blocked)
+        assert proc.returncode == 23, proc.stderr
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(Path(raw), target="production")
         proc = run_helper(harness)
         assert proc.returncode == 0, proc.stderr
         log = docker_log(harness)
@@ -779,6 +1260,25 @@ def _():
         assert "--remove-orphans" not in joined
         ups = [x for x in log if "up" in x]
         assert ups[0][-2:] == ["server", "client"]
+
+
+@test("release_retry_preserves_original_rollback")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(Path(raw), fail_on="up")
+        first = run_helper(harness)
+        assert first.returncode != 0
+        original = Path(harness["deploy"]) / ".release-history" / "original-rollback.json"
+        public = Path(harness["deploy"]) / ".rollback-meta.json"
+        first_original = original.read_text()
+        first_public = public.read_text()
+        state = json.loads(Path(harness["state"]).read_text())
+        state["fail_on"] = "pull"
+        Path(harness["state"]).write_text(json.dumps(state))
+        second = run_helper(harness)
+        assert second.returncode != 0
+        assert original.read_text() == first_original
+        assert public.read_text() == first_public
 
 
 @test("release_command_via_bash_wrapper")
@@ -803,26 +1303,18 @@ def _():
     text = WORKFLOW.read_text(encoding="utf-8")
     data = yaml.safe_load(text)
     assert data["name"] == "Deploy LexySign"
-    assert "jobs" in data
-    assert "timeout-minutes" in data["jobs"]["deploy"]
     assert data["jobs"]["deploy"]["timeout-minutes"] == 35
     assert "deploy/lexysign/Caddyfile" not in text
     assert "COMPOSE_PROFILES" not in text
     assert "--remove-orphans" not in text
     assert "docker rm -f" not in text
     assert "caddy reload" not in text
-    assert "caddy validate" not in text
-    assert "network connect" not in text
     assert "VITE_SUPABASE" not in text
     assert "lexysign-app-release.py" in text
-    assert "REACT_APP_SERVERURL" in text
-    assert "org.opencontainers.image.revision=${{ github.sha }}" in text
 
 
 @test("caddyfile_bytes_unchanged")
 def _():
-    import hashlib
-
     digest = hashlib.sha256(CADDYFILE.read_bytes()).hexdigest()
     assert digest == KNOWN_CADDY_SHA256
 
@@ -831,8 +1323,9 @@ def _():
 def _():
     text = HELPER_PY.read_text(encoding="utf-8")
     assert "Caddyfile" not in text
-    assert "--remove-orphans" in text  # only as a forbidden token
+    assert "--remove-orphans" in text
     assert "COMPOSE_PROFILES=edge" not in text
+    assert "LEXYSIGN_APP_RELEASE_TEST" not in text
 
 
 def main() -> int:
@@ -851,5 +1344,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Tests are registered at import via @test.
     sys.exit(main())

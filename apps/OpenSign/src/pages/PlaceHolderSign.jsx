@@ -64,6 +64,14 @@ import LottieWithLoader from "../primitives/DotLottieReact";
 import Alert from "../primitives/Alert";
 import WidgetsValueModal from "../components/pdf/WidgetsValueModal";
 import * as utils from "../utils";
+import {
+  applyDraftFieldsToPdfDetails,
+  assertActiveSession,
+  buildDraftSavePayload,
+  buildFinalizePayload,
+  evaluateFinalizeGuard,
+  shouldExposeSignerShareLinks
+} from "../utils/draftDocumentPreparation";
 import { resetWidgetState, setPrefillImg } from "../redux/reducers/widgetSlice";
 import EditDocument from "../components/pdf/EditTemplate";
 import CustomizeMail from "../components/pdf/CustomizeMail";
@@ -1069,7 +1077,8 @@ function PlaceHolderSign() {
       alert(t("something-went-wrong-mssg"));
     }
   };
-  //function to use save placeholder details in contracts_document
+  // Next persists a recoverable draft. Dispatch flags are written only by
+  // finalizeInvitation on explicit Send / Share / owner-first self-sign.
   const saveDocumentDetails = utils.withSessionValidation(async () => {
     setIsUiLoading(true);
     let signerMail = signersdata.slice();
@@ -1077,79 +1086,113 @@ function PlaceHolderSign() {
     if (pdfDetails?.[0]?.SendinOrder && pdfDetails?.[0]?.SendinOrder === true) {
       signerMail.splice(1);
     }
-    const pdfUrl = await embedPrefilllWidgets();
-    if (pdfUrl) {
-      const removePrefillSigner = signersdata.filter(
-        (x) => x.Role !== "prefill"
-      );
-      const signers = removePrefillSigner?.map((x) => {
-        return {
-          __type: "Pointer",
-          className: "contracts_Contactbook",
-          objectId: x.objectId
-        };
-      });
-      const addExtraDays = pdfDetails?.[0]?.TimeToCompleteDays
-        ? pdfDetails[0].TimeToCompleteDays
-        : 15;
-      const currentUser = signersdata.find((x) => x.Email === currentId);
-      setCurrentId(currentUser?.objectId);
-      // Compute expiry date with extra days
-      let updateExpiryDate = new Date();
-      updateExpiryDate.setDate(updateExpiryDate.getDate() + addExtraDays);
-      try {
-        const data = {
-          Name: docTitle || pdfDetails?.[0]?.Name,
-          Placeholders: signerPos,
-          SignedUrl: pdfUrl,
-          URL: pdfUrl,
-          Signers: signers,
-          SentToOthers: true,
-          SignatureType: pdfDetails?.[0]?.SignatureType,
-          ExpiryDate: { iso: updateExpiryDate, __type: "Date" }
-        };
-        await axios.put(
-          `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
-          data,
-          {
-            headers: {
-              "Content-Type": "application/json",
-              "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
-              "X-Parse-Session-Token": localStorage.getItem("accesstoken")
-            }
-          }
+    try {
+      const pdfUrl = await embedPrefilllWidgets();
+      if (pdfUrl) {
+        const removePrefillSigner = signersdata.filter(
+          (x) => x.Role !== "prefill"
         );
-        if (docTitle) {
-          const updatedPdfDetails = [...pdfDetails];
-          updatedPdfDetails[0].Name = docTitle;
-          setPdfDetails(updatedPdfDetails);
-        }
-        setIsLoading({ isLoad: false });
-        setIsUiLoading(false);
-        setIsSendAlert({ mssg: "confirm", alert: true });
-        const ownerId = pdfDetails[0].ExtUserPtr?.UserId?.objectId;
-        const firstSigner = signersdata[0];
-        const isOwner = firstSigner?.UserId?.objectId === ownerId;
-        if (pdfDetails[0]?.SendinOrder && isOwner) {
-          setIsCurrUser(ownerId);
-          setIsSend(true);
-        } else {
-          const currentSigner = signersdata?.find(
-            (x) => x?.UserId?.objectId === ownerId
+        const signers = removePrefillSigner?.map((x) => {
+          return {
+            __type: "Pointer",
+            className: "contracts_Contactbook",
+            objectId: x.objectId
+          };
+        });
+        const currentUser = signersdata.find((x) => x.Email === currentId);
+        setCurrentId(currentUser?.objectId);
+        try {
+          const data = buildDraftSavePayload({
+            name: docTitle || pdfDetails?.[0]?.Name,
+            placeholders: signerPos,
+            url: pdfUrl,
+            signers,
+            signatureType: pdfDetails?.[0]?.SignatureType
+          });
+          await axios.put(
+            `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
+            data,
+            {
+              headers: {
+                "Content-Type": "application/json",
+                "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
+                "X-Parse-Session-Token": localStorage.getItem("accesstoken")
+              }
+            }
           );
-          if (currentSigner) {
-            setIsCurrUser(currentSigner?.objectId);
+          setPdfDetails(applyDraftFieldsToPdfDetails(pdfDetails, data));
+          setIsLoading({ isLoad: false });
+          setIsSendAlert({ mssg: "confirm", alert: true });
+          const ownerId = pdfDetails[0].ExtUserPtr?.UserId?.objectId;
+          const firstSigner = signersdata[0];
+          const isOwner = firstSigner?.UserId?.objectId === ownerId;
+          if (pdfDetails[0]?.SendinOrder && isOwner) {
+            setIsCurrUser(ownerId);
+            setIsSend(true);
+          } else {
+            const currentSigner = signersdata?.find(
+              (x) => x?.UserId?.objectId === ownerId
+            );
+            if (currentSigner) {
+              setIsCurrUser(currentSigner?.objectId);
+            }
+            setIsMailModal(true);
           }
-          setIsMailModal(true);
+        } catch (e) {
+          console.log("error", e);
+          alert(t("something-went-wrong-mssg"));
         }
-      } catch (e) {
-        console.log("error", e);
-        alert(t("something-went-wrong-mssg"));
       }
-    } else {
+    } finally {
       setIsUiLoading(false);
     }
   });
+
+  const finalizeInvitation = async () => {
+    assertActiveSession({
+      tenantId: localStorage.getItem("TenantId"),
+      sessionToken: localStorage.getItem("accesstoken")
+    });
+    const documentData = await contractDocument(documentId);
+    if (!Array.isArray(documentData) || documentData.length === 0) {
+      throw new Error(t("something-went-wrong-mssg"));
+    }
+    const current = documentData[0];
+    const guard = evaluateFinalizeGuard(current);
+    if (!guard.ok) {
+      const err = new Error(guard.message);
+      err.name = "FinalizeInvitationError";
+      err.code = guard.code;
+      throw err;
+    }
+    const data = buildFinalizePayload({
+      signedUrl: guard.signedUrl,
+      timeToCompleteDays:
+        current.TimeToCompleteDays || pdfDetails?.[0]?.TimeToCompleteDays || 15
+    });
+    await axios.put(
+      `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
+      data,
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
+          "X-Parse-Session-Token": localStorage.getItem("accesstoken")
+        }
+      }
+    );
+    if (pdfDetails?.[0]) {
+      const updatedPdfDetails = [...pdfDetails];
+      updatedPdfDetails[0] = {
+        ...updatedPdfDetails[0],
+        SignedUrl: data.SignedUrl,
+        SentToOthers: true,
+        ExpiryDate: data.ExpiryDate
+      };
+      setPdfDetails(updatedPdfDetails);
+    }
+    return data;
+  };
 
   const copytoclipboard = (text) => {
     copytoData(text);
@@ -1160,7 +1203,24 @@ function PlaceHolderSign() {
     setTimeout(() => setCopied(false), 1500); // Reset copied state after 1.5 seconds
   };
   //function show signer list and share link to share signUrl
+  const handleActivateShareLink = async (signer) => {
+    if (!shouldExposeSignerShareLinks(pdfDetails?.[0])) {
+      try {
+        await finalizeInvitation();
+      } catch (e) {
+        if (e?.code !== "already-dispatched") throw e;
+      }
+    }
+    const objectId = signer.objectId;
+    const hostUrl = window.location.origin;
+    const sendMail = false;
+    const encodeBase64 = btoa(
+      `${pdfDetails?.[0].objectId}/${signer.Email}/${objectId}/${sendMail}`
+    );
+    copytoclipboard(`${hostUrl}/login/${encodeBase64}`);
+  };
   const handleShareList = () => {
+    const shareActivated = shouldExposeSignerShareLinks(pdfDetails?.[0]);
     const shareLinkList = [];
     let signerMail = signersdata;
     for (let i = 0; i < signerMail.length; i++) {
@@ -1174,7 +1234,8 @@ function PlaceHolderSign() {
       let signPdf = `${hostUrl}/login/${encodeBase64}`;
       shareLinkList.push({
         signerEmail: signerMail[i].Email,
-        url: signPdf
+        url: shareActivated ? signPdf : "",
+        signer: signerMail[i]
       });
     }
     return shareLinkList.map((data, ind) => {
@@ -1189,20 +1250,27 @@ function PlaceHolderSign() {
           </span>
           <div className="flex flex-row items-center gap-3 ">
             <button
-              onClick={() => copytoclipboard(data.url)}
+              onClick={() =>
+                handleActivateShareLink(data.signer).catch((e) => {
+                  console.log("error", e);
+                  alert(e?.message || t("something-went-wrong-mssg"));
+                })
+              }
               type="button"
               className="flex flex-row items-center op-link op-link-primary"
             >
               <i className="fa-light fa-copy" />
               <span className="hidden md:block ml-1 ">{t("copy-link")}</span>
             </button>
-            <ShareButton
-              title={t("sign-url")}
-              text={t("sign-url")}
-              url={data.url}
-            >
-              <i className="fa-light fa-share-from-square op-link opensigncss:op-link-secondary opensigndark:op-link-primary no-underline"></i>
-            </ShareButton>
+            {shareActivated && (
+              <ShareButton
+                title={t("sign-url")}
+                text={t("sign-url")}
+                url={data.url}
+              >
+                <i className="fa-light fa-share-from-square op-link opensigncss:op-link-secondary opensigndark:op-link-primary no-underline"></i>
+              </ShareButton>
+            )}
           </div>
         </div>
       );
@@ -1600,7 +1668,18 @@ function PlaceHolderSign() {
       }
     }
   };
-  const handleRecipientSign = () => {
+  const handleRecipientSign = async () => {
+    if (!isAlreadyPlace?.status) {
+      try {
+        await finalizeInvitation();
+      } catch (e) {
+        if (e?.code !== "already-dispatched") {
+          console.log("error", e);
+          alert(e?.message || t("something-went-wrong-mssg"));
+          return;
+        }
+      }
+    }
     if (currentId) {
       navigate(`/recipientSignPdf/${documentId}/${currentId}`);
     } else {
@@ -2365,6 +2444,7 @@ function PlaceHolderSign() {
             copyUrlRef={copyUrlRef}
             emailEditorType={emailEditorType}
             setEmailEditorType={setEmailEditorType}
+            beforeSend={finalizeInvitation}
           />
         </div>
       )}

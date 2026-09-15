@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import ModalUi from "../../primitives/ModalUi";
 import { EmailBody } from "./EmailBody";
 import {
@@ -21,6 +21,7 @@ function CustomizeMail(props) {
   const [isCustomize, setIsCustomize] = useState(false);
   const [isReset, setIsReset] = useState(false);
   const [isLoader, setIsLoader] = useState(false);
+  const sendingRef = useRef(false);
 
   const handleCloseSendmailModal = () => {
     if (props?.handleClose) {
@@ -32,41 +33,63 @@ function CustomizeMail(props) {
   };
 
   const handleEmailSendToSigners = async () => {
+    if (sendingRef.current) return;
+    sendingRef.current = true;
     setIsLoader(true);
-    const documentData = await contractDocument(props?.documentId);
-    if (documentData && documentData?.length > 0) {
-      props?.setDocumentDetails && props?.setDocumentDetails(documentData[0]);
-      if (
-        documentData?.[0]?.SendinOrder &&
-        documentData?.[0]?.SendinOrder === true
-      ) {
-        const ownerEmail = documentData[0].ExtUserPtr.Email;
-        const ownerDetails = documentData[0].Signers.find(
-          (x) => x.Email === ownerEmail
-        );
-        props?.setCurrUserId && props?.setCurrUserId(ownerDetails?.objectId);
+    let mailAttempted = false;
+    try {
+      if (typeof props?.beforeSend === "function") {
+        await props.beforeSend();
       }
-      const customMail = {
-        body:
-          props?.emailEditorType === "basic"
-            ? props?.customizeMail?.body?.basic
-            : props?.customizeMail?.body?.advanced,
-        subject: props?.customizeMail?.subject
-      };
-      //function is used to send email to signers for sign the document
-      const mailRes = await sendEmailToSigners(
-        documentData,
-        props?.signerList,
-        customMail,
-        props?.defaultMail,
-        isCustomize,
-      );
-      props?.setIsMailModal(false);
-      props?.setIsSend(true);
+      const documentData = await contractDocument(props?.documentId);
+      if (documentData && documentData?.length > 0) {
+        if (typeof props?.beforeSend === "function" && !documentData[0]?.SignedUrl) {
+          throw new Error(t("something-went-wrong-mssg"));
+        }
+        props?.setDocumentDetails && props?.setDocumentDetails(documentData[0]);
+        if (
+          documentData?.[0]?.SendinOrder &&
+          documentData?.[0]?.SendinOrder === true
+        ) {
+          const ownerEmail = documentData[0].ExtUserPtr.Email;
+          const ownerDetails = documentData[0].Signers.find(
+            (x) => x.Email === ownerEmail
+          );
+          props?.setCurrUserId && props?.setCurrUserId(ownerDetails?.objectId);
+        }
+        const customMail = {
+          body:
+            props?.emailEditorType === "basic"
+              ? props?.customizeMail?.body?.basic
+              : props?.customizeMail?.body?.advanced,
+          subject: props?.customizeMail?.subject
+        };
+        mailAttempted = true;
+        const mailRes = await sendEmailToSigners(
+          documentData,
+          props?.signerList,
+          customMail,
+          props?.defaultMail,
+          isCustomize,
+        );
+        props?.setIsMailModal(false);
+        props?.setIsSend(true);
+        props?.setMailStatus(statusMap[mailRes?.status] ?? "failed");
+      } else {
+        alert(t("something-went-wrong-mssg"));
+      }
+    } catch (err) {
+      console.log("error", err);
+      if (mailAttempted) {
+        props?.setIsMailModal(false);
+        props?.setIsSend(true);
+        props?.setMailStatus("failed");
+      } else {
+        alert(err?.message || t("something-went-wrong-mssg"));
+      }
+    } finally {
+      sendingRef.current = false;
       setIsLoader(false);
-      props?.setMailStatus(statusMap[mailRes?.status] ?? "failed");
-    } else {
-      alert("something-went-wrong-mssg");
     }
   };
 
@@ -135,6 +158,7 @@ function CustomizeMail(props) {
               <div className="flex flex-row gap-2">
                 <button
                   onClick={() => handleEmailSendToSigners()}
+                  disabled={isLoader}
                   className="op-btn op-btn-primary font-[500] text-sm shadow"
                 >
                   {t("send")}

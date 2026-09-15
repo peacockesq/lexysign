@@ -52,7 +52,32 @@ sign.peacockesq.com {
   reverse_proxy opensign-test-client:3000
 }
 
+doc-v2.lexyalgo.com, staging-doc.lexyalgo.com, doc-v2.37.27.49.209.sslip.io {
+  encode zstd gzip
+  reverse_proxy docassemble-lexy-v2:80 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-For {remote_host}
+    header_up X-Forwarded-Proto https
+    header_up X-Forwarded-Ssl on
+    header_up X-Forwarded-Port 443
+  }
+}
+
 uts-api.peacockesq.com {
   encode zstd gzip
   reverse_proxy uts-ingestion-api:8788
 }
+
+# BEGIN APIARY FOUNDRY STATIC SITE — canonical production route
+# Keep this block when regenerating/redeploying the shared Caddyfile.
+apiaryfoundry.com, www.apiaryfoundry.com {
+  encode zstd gzip
+  reverse_proxy 172.19.0.7:8080
+}
+
+staging.apiaryfoundry.com {
+  encode zstd gzip
+  reverse_proxy 172.19.0.6:8080
+}
+# END APIARY FOUNDRY STATIC SITE

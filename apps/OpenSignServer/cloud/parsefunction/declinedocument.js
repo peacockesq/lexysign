@@ -1,13 +1,5 @@
-import axios from 'axios';
-import { appName, brandColor, brandEmailLogo, cloudServerUrl, serverAppId } from '../../Utils.js';
-const serverUrl = cloudServerUrl;
-const APPID = serverAppId;
-const masterKEY = process.env.MASTER_KEY;
-const headers = {
-  'Content-Type': 'application/json',
-  'X-Parse-Application-Id': APPID,
-  'X-Parse-Master-Key': masterKEY,
-};
+import { appName, brandColor, brandEmailLogo } from '../../Utils.js';
+import sendSystemMail from './sendSystemMail.js';
 
 async function sendDeclineMail(doc, publicUrl, userId, reason) {
   try {
@@ -45,7 +37,7 @@ async function sendDeclineMail(doc, publicUrl, userId, reason) {
       pdfName: pdfName,
       html: body,
     };
-    await axios.post(serverUrl + '/functions/sendmailv3', params, { headers });
+    await sendSystemMail({ params });
   } catch (err) {
     console.log('err in sendnotifymail', err);
   }
@@ -62,16 +54,21 @@ export default async function declinedocument(request) {
   try {
     const docCls = new Parse.Query('contracts_Document');
     docCls.include('ExtUserPtr.TenantId,Placeholders.signerPtr,Signers');
+    docCls.notEqualTo('IsCompleted', true);
+    docCls.notEqualTo('IsArchive', true);
     const updateDoc = await docCls.get(docId, { useMasterKey: true });
     if (updateDoc) {
       const _doc = JSON.parse(JSON.stringify(updateDoc));
       const isEnableOTP = updateDoc?.get('IsEnableOTP') || false;
+      const isCreator = _doc?.CreatedBy?.objectId === userId;
       if (!isEnableOTP) {
         updateDoc.set('IsDeclined', true);
         updateDoc.set('DeclineReason', reason);
         updateDoc.set('DeclineBy', declineBy);
         await updateDoc.save(null, { useMasterKey: true });
-        sendDeclineMail(_doc, publicUrl, userId, reason);
+        if (!isCreator) {
+          sendDeclineMail(_doc, publicUrl, userId, reason);
+        }
         return 'document declined';
       } else {
         if (!request?.user) {
@@ -81,7 +78,10 @@ export default async function declinedocument(request) {
         updateDoc.set('DeclineReason', reason);
         updateDoc.set('DeclineBy', declineBy);
         await updateDoc.save(null, { useMasterKey: true });
-        sendDeclineMail(_doc, publicUrl, userId, reason);
+        const isCreator = _doc?.CreatedBy?.objectId === request?.user?.id;
+        if (!isCreator) {
+          sendDeclineMail(_doc, publicUrl, userId, reason);
+        }
         return 'document declined';
       }
     } else {

@@ -1,10 +1,7 @@
-import fs from 'node:fs';
-import https from 'https';
 import formData from 'form-data';
 import Mailgun from 'mailgun.js';
 import { appName, smtpenable, smtpsecure, updateMailCount } from '../../Utils.js';
 import { createTransport } from 'nodemailer';
-import axios from 'axios';
 import { assertCanUseESignUnits, getTenantForExtUser } from '../../billing/entitlements.js';
 async function sendMailProvider(req) {
   const app = appName;
@@ -20,8 +17,8 @@ async function sendMailProvider(req) {
   const reportMsg = process.env.EMAIL_FOOTER_HTML || '';
 
   const mailgunApiKey = process.env.MAILGUN_API_KEY;
+  let transporterSMTP;
   try {
-    let transporterSMTP;
     let mailgunClient;
     let mailgunDomain;
     if (smtpenable) {
@@ -60,6 +57,7 @@ async function sendMailProvider(req) {
       text: req.params.text || 'mail',
       html: req.params?.html ? req.params.html + reportMsg : '',
       bcc: req.params.bcc ? req.params.bcc : undefined,
+      cc: req.params.cc ? req.params.cc : undefined,
       replyTo: replyto ? replyto : undefined,
     };
 
@@ -93,6 +91,10 @@ async function sendMailProvider(req) {
     }
     if (err) {
       return { status: 'error' };
+    }
+  } finally {
+    if (transporterSMTP) {
+      transporterSMTP?.close?.();
     }
   }
 }

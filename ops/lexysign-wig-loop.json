@@ -1,0 +1,30 @@
+{
+  "workflow": "lexysign-release-discipline-and-production-cutover",
+  "lane": "LexySign",
+  "owner": "Alfred",
+  "status": "in_progress",
+  "updatedAt": "2026-05-09T21:05:00Z",
+  "currentStep": "clear stuck production deploy and prove main-backed runtime",
+  "nextAction": "inspect GitHub deploy run and Hetzner docker compose processes; patch deploy timeout; rerun production deploy",
+  "blocker": "production deploy run 25609856581 appears stuck in remote docker compose pull; prod containers last observed still on staging image tags",
+  "proof": [
+    "staging deploy passed: https://github.com/peacockesq/peacock-sign/actions/runs/25609674893",
+    "release PR merged: https://github.com/peacockesq/peacock-sign/pull/2",
+    "main production deploy run started: https://github.com/peacockesq/peacock-sign/actions/runs/25609856581",
+    "prod client/server image build jobs in run 25609856581 passed; deploy job in progress at prior compaction"
+  ],
+  "qaGate": {
+    "required": true,
+    "definition": [
+      "GitHub deploy workflow has timeout protection for remote pull/up/smoke steps",
+      "production deploy run completes successfully from main",
+      "Hetzner production containers run production/main-tagged GHCR images, not staging tags",
+      "https://sign.lexyalgo.com loads successfully",
+      "protected API boundary returns expected unauthenticated 401/403 without secrets",
+      "docs exist for Eva/docassemble LexySign signature tags and LexyQDRO/divorce integration"
+    ],
+    "status": "pending",
+    "verifiedBy": null,
+    "proof": []
+  }
+}

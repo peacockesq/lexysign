@@ -8,6 +8,8 @@ on:
       - 'apps/OpenSignServer/**'
       - 'deploy/lexysign/**'
       - '.github/workflows/lexysign-*.yml'
+      - 'scripts/ci/**'
+      - 'tests/parity/**'
   push:
     branches: [lexysign-hetzner-prep, staging, main]
     paths:
@@ -15,6 +17,8 @@ on:
       - 'apps/OpenSignServer/**'
       - 'deploy/lexysign/**'
       - '.github/workflows/lexysign-*.yml'
+      - 'scripts/ci/**'
+      - 'tests/parity/**'
   workflow_dispatch:
 
 permissions:
@@ -30,33 +34,94 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch origin/main for scan base
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Server syntax checks
         run: |
+          set -euo pipefail
           node --check apps/OpenSignServer/Utils.js
+          node --check apps/OpenSignServer/index.js
+          node --check apps/OpenSignServer/cloud/main.js
           node --check apps/OpenSignServer/cloud/customRoute/billing.js
+          node --check apps/OpenSignServer/cloud/customRoute/customApp.js
           node --check apps/OpenSignServer/billing/stripeClient.js
+          node --check apps/OpenSignServer/billing/entitlements.js
           node --check apps/OpenSignServer/cloud/parsefunction/loginWithSupabase.js
           node --check apps/OpenSignServer/cloud/customRoute/docxtopdf.js
+          node --check apps/OpenSignServer/cloud/customRoute/deleteAccount/deleteFileUrl.js
+          node --check apps/OpenSignServer/cloud/parsefunction/AddAdmin.js
+          node --check apps/OpenSignServer/spec/lexysignContracts.test.js
+      - name: Secret scan guard tests
+        run: python3 scripts/ci/secret_scan_test.py
       - name: Secret value scan on changed files
+        run: |
+          python3 scripts/ci/secret_scan.py \
+            --event "${{ github.event_name }}" \
+            --base "${{ github.event.pull_request.base.sha || github.event.before || '' }}" \
+            --head HEAD
+
+  server-node-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/OpenSignServer/package-lock.json
+      - name: Install server dependencies
+        working-directory: apps/OpenSignServer
+        run: npm ci --omit=dev --no-audit --no-fund
+      - name: Node contract tests
+        working-directory: apps/OpenSignServer
+        run: npm run test:node
+
+  client-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/OpenSign/package-lock.json
+      - name: Install client dependencies
+        working-directory: apps/OpenSign
+        run: npm ci --no-audit --no-fund
+      - name: Node contract tests
+        working-directory: apps/OpenSign
+        run: npm run test:node
+      - name: Vitest
+        working-directory: apps/OpenSign
+        run: npm test
+
+  parity-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run parity tests
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE_SHA="${{ github.event.before }}"
+          set -euo pipefail
+          if [[ ! -d tests/parity ]]; then
+            echo "tests/parity is required; refusing to skip." >&2
+            exit 1
           fi
-          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-            BASE_SHA="${{ github.sha }}^"
+          shopt -s nullglob
+          files=(tests/parity/*.test.mjs)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no tests/parity/*.test.mjs; refusing to skip." >&2
+            exit 1
           fi
-          git diff --name-only "$BASE_SHA" "${{ github.sha }}" \
-            | grep -Ev '(^|/)(package-lock\.json|.*\.png|.*\.ico)$' \
-            > /tmp/changed-files.txt || true
-          if [[ -s /tmp/changed-files.txt ]]; then
-            ! xargs grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY-----|sk_live_[A-Za-z0-9]{20,}|whsec_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}' < /tmp/changed-files.txt
-          fi
+          node --test "${files[@]}"
 
   docker-build:
     runs-on: ubuntu-latest

@@ -153,6 +153,9 @@ function WidgetsValueModal(props) {
   const type = currWidgetsDetails?.type;
   const widgetTypeTranslation = t(`widgets-name.${currWidgetsDetails?.type}`);
 
+  const getLogicMap = () => new Map();
+
+
   const [widgetValue, setWidgetValue] = useState(() => {
     if (currWidgetsDetails.type === "checkbox") {
       return undefined;
@@ -195,7 +198,10 @@ function WidgetsValueModal(props) {
   // below useEffect is used to focus text widgets when user open modal
   useEffect(() => {
     if (widgetRef?.current) {
-      const clearFocus = setTimeout(() => widgetRef?.current.focus(), 10);
+      const clearFocus = setTimeout(
+        () => widgetRef?.current.focus({ preventScroll: true }),
+        10
+      );
       return () => clearTimeout(clearFocus);
     }
   }, [widgetRef.current]);
@@ -345,9 +351,9 @@ function WidgetsValueModal(props) {
         prev.map((signer) => {
           if (signer.Id !== uniqueId) return signer;
 
-          // Find the placeholder index for current page
-          const index = signer.placeHolder.findIndex(
-            (x) => x.pageNumber === pageNumber
+          // Find the placeholder index for the page containing the current widget
+          const index = signer.placeHolder.findIndex((x) =>
+            x.pos?.some((p) => p.key === currWidgetsDetails?.key)
           );
           // Get updated placeholder list
           const updatedPlaceholders = onSaveImage(
@@ -388,9 +394,9 @@ function WidgetsValueModal(props) {
         }
       }
     } else {
-      const index = props?.xyPosition?.findIndex((object) => {
-        return object.pageNumber === pageNumber;
-      });
+      const index = props?.xyPosition?.findIndex(
+        (p) => p.pageNumber === (currWidgetsDetails?.pageNumber || pageNumber)
+      );
       const getImage = onSaveImage(
         signatureType,
         props?.xyPosition,
@@ -447,8 +453,8 @@ function WidgetsValueModal(props) {
         prevState.map((signer) => {
           if (signer.Id !== uniqueId) return signer;
 
-          const placeholderIndex = signer.placeHolder.findIndex(
-            (x) => x.pageNumber === pageNumber
+          const placeholderIndex = signer.placeHolder.findIndex((x) =>
+            x.pos?.some((p) => p.key === currWidgetsDetails?.key)
           );
           const updatedPlaceholders = onSaveSign(
             signType,
@@ -485,9 +491,9 @@ function WidgetsValueModal(props) {
         );
       }
     } else {
-      const index = props?.xyPosition?.findIndex((object) => {
-        return object.pageNumber === pageNumber;
-      });
+      const index = props?.xyPosition?.findIndex(
+        (p) => p.pageNumber === (currWidgetsDetails?.pageNumber || pageNumber)
+      );
       const getUpdatePosition = onSaveSign(
         signType,
         props?.xyPosition,
@@ -1047,6 +1053,11 @@ function WidgetsValueModal(props) {
         ? e.target?.value?.trim()
         : e.target.value;
     setWidgetValue(value);
+    props.setCurrWidgetsDetails?.((prev) =>
+      prev && prev.key === currWidgetsDetails?.key
+        ? { ...prev, options: { ...prev.options, response: value } }
+        : prev
+    );
     onChangeInput(
       value,
       currWidgetsDetails,
@@ -1591,26 +1602,34 @@ function WidgetsValueModal(props) {
           <div
             className={`border-[1px] border-gray-300 rounded-[2px] pt-1 px-2.5 ${radioWrapperClass}`}
           >
-            {currWidgetsDetails?.options?.values.map((data, ind) => (
-              <div key={ind} className="text-base-content select-none-cls">
-                <label
-                  // htmlFor={`radio-${currWidgetsDetails?.key + ind}`}
-                  className="cursor-pointer flex items-center text-sm gap-1"
-                >
-                  <input
-                    id={`radio-${currWidgetsDetails?.key + ind}`}
-                    className={`op-radio op-radio-xs mt-1`}
-                    type="radio"
-                    value={data}
-                    checked={handleRadioCheck(data?.trim())}
-                    onChange={(e) => {
-                      handleCheckRadio(e.target.value?.trim());
-                    }}
-                  />
-                  <span>{data}</span>
-                </label>
-              </div>
-            ))}
+            {currWidgetsDetails?.options?.values.map((data, ind) => {
+              const label =
+                typeof data === "string"
+                  ? data
+                  : data && typeof data === "object" && data.name != null
+                    ? String(data.name)
+                    : "";
+              return (
+                <div key={ind} className="text-base-content select-none-cls">
+                  <label
+                    // htmlFor={`radio-${currWidgetsDetails?.key + ind}`}
+                    className="cursor-pointer flex items-center text-sm gap-1"
+                  >
+                    <input
+                      id={`radio-${currWidgetsDetails?.key + ind}`}
+                      className={`op-radio op-radio-xs mt-1`}
+                      type="radio"
+                      value={label}
+                      checked={handleRadioCheck(label?.trim())}
+                      onChange={(e) => {
+                        handleCheckRadio(e.target.value?.trim());
+                      }}
+                    />
+                    <span>{label}</span>
+                  </label>
+                </div>
+              );
+            })}
           </div>
         );
       case textWidget:
@@ -1653,6 +1672,10 @@ function WidgetsValueModal(props) {
 
   //function is used to check current widget is required or optional
   const handleCheckOptional = () => {
+
+    const effectiveStatus =
+      currWidgetsDetails?.options?.status ||
+      "required";
     let isRequired = false;
     const isCheckBox =
       !currWidgetsDetails.options?.isReadOnly &&
@@ -1666,14 +1689,16 @@ function WidgetsValueModal(props) {
         isRequired = true;
       }
     } else {
-      isRequired = currWidgetsDetails.options?.status === "required";
+      isRequired = effectiveStatus === "required";
     }
     if (isRequired) {
       setIsOptional(false);
     }
   };
+
   //function is used to show how many field left and how many total widget
   const HandleRequiredField = () => {
+
     let widgetsPosition = [];
     if (uniqueId) {
       const currSignerWidget = xyPosition?.find(
@@ -1683,28 +1708,25 @@ function WidgetsValueModal(props) {
     } else {
       widgetsPosition = xyPosition;
     }
+
     //generate all nested level in single level
     const flatPlaceholder = widgetsPosition?.flatMap((page) =>
       page.pos
-        .filter((widget) => !widget.options?.isReadOnly)
-        .map((widget) => ({
-          widget,
-          pageNumber: page.pageNumber
-        }))
+        .filter((widget) => {
+          if (widget.options?.isReadOnly) return false;
+          return true;
+        })
+        .map((widget) => ({ widget, pageNumber: page.pageNumber }))
     );
     let totalWidget = 0;
     let alreadyValue = 0;
-    widgetsPosition?.forEach((page) => {
-      page.pos.forEach((field) => {
-        if (!field?.options?.isReadOnly) {
-          const isValueExist =
-            field.options?.response || field.options?.defaultValue;
-          totalWidget++;
-          if (isValueExist) {
-            alreadyValue++;
-          }
-        }
-      });
+    flatPlaceholder?.forEach(({ widget: field }) => {
+      const isValueExist =
+        field.options?.response || field.options?.defaultValue;
+      totalWidget++;
+      if (isValueExist) {
+        alreadyValue++;
+      }
     });
 
     const leftRequiredWidget = totalWidget - alreadyValue;
@@ -1780,8 +1802,8 @@ function WidgetsValueModal(props) {
         prev.map((signer) => {
           if (signer.Id !== uniqueId) return signer;
 
-          const idx = signer?.placeHolder?.findIndex(
-            (p) => p.pageNumber === pageNumber
+          const idx = signer?.placeHolder?.findIndex((p) =>
+            p.pos?.some((w) => w.key === widgetKey)
           );
           if (idx === -1) return signer;
 
@@ -1829,17 +1851,18 @@ function WidgetsValueModal(props) {
       const editableWidgets = (widgetsPosition?.placeHolder ?? []).flatMap(
         ({ pos = [], pageNumber }) =>
           pos
-            .filter(
-              ({ options }) =>
-                !options?.isReadOnly
-            )
+            .filter(({ options, key }) => {
+              if (
+                options?.isReadOnly
+              )
+                return false;
+              return true; // ← must be OUTSIDE the ee block
+            })
             .map((widget) => ({ widget, pageNumber }))
       );
       //get current index of widget
       const currentIndex = editableWidgets.findIndex(
-        (item) =>
-          item.widget.key === currWidgetsDetails?.key &&
-          item.pageNumber === pageNumber
+        (item) => item.widget.key === currWidgetsDetails?.key
       );
       //get totoal widget length
       const totalItems = editableWidgets?.length;
@@ -1862,7 +1885,10 @@ function WidgetsValueModal(props) {
       }
 
       dispatch(setIsShowModal({ [nextWidgetDetails?.key]: true }));
-      props.setCurrWidgetsDetails(nextWidgetDetails);
+      props.setCurrWidgetsDetails({
+        ...nextWidgetDetails,
+        pageNumber: nextItem?.pageNumber
+      });
     }
 
   };
@@ -1934,11 +1960,15 @@ function WidgetsValueModal(props) {
   //'handleFinishButton' function is used to show finish button click on any widget if all required widgets have response
   const handleFinishButton = () => {
     const widgetsPosition = xyPosition?.find((data) => data.Id === uniqueId);
+
     //using 'flatMap' create all nested array in one level
     const editableWidgets = widgetsPosition?.placeHolder?.flatMap((page) =>
       page.pos
-        .filter((widget) => !widget.options?.isReadOnly)
-        .map((widget) => widget)
+        .filter((widget) => {
+          if (widget.options?.isReadOnly) return false;
+          return true; // ← outside ee block
+        })
+        .map((widget) => ({ ...widget, pageNumber: page.pageNumber }))
     );
     const getcurrentwidget = editableWidgets?.find(
       (data) => data?.key === currWidgetsDetails?.key
@@ -1947,8 +1977,12 @@ function WidgetsValueModal(props) {
       props?.setCurrWidgetsDetails(getcurrentwidget);
     }
     let isResponse = true;
-    //condition to check all required widgets have response or not then show finish buutton
+    //condition to check all required widgets have response or not then show finish button
     for (const data of editableWidgets) {
+      // Use the dynamic required status (respects require/optional logic actions).
+      const effectiveStatus =
+        data.options?.status ||
+        "required";
       if (data?.type === "checkbox") {
         const minCount = data.options?.validation?.minRequiredCount;
         const parseMin = minCount && parseInt(minCount);
@@ -1964,7 +1998,7 @@ function WidgetsValueModal(props) {
       } else if (
         !data.options.response &&
         !data?.options?.defaultValue &&
-        data.options?.status === "required"
+        effectiveStatus === "required"
       ) {
         isResponse = false;
         break;
@@ -2003,7 +2037,9 @@ function WidgetsValueModal(props) {
             <>
               <div className="p-1 mt-3">
                 <span className="text-base text-base-content">
-                  {t("finish-mssg")}
+                  {
+                        t("finish-mssg")
+                  }
                 </span>
               </div>
               <div className="flex gap-3 items-center mt-4">
@@ -2012,7 +2048,9 @@ function WidgetsValueModal(props) {
                   className="op-btn op-btn-primary op-btn-sm px-4"
                   onClick={() => handleFinish()}
                 >
-                  {t("finish")}
+                  {
+                        t("finish")
+                  }
                 </button>
                 <button
                   type="button"

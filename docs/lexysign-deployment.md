@@ -20,8 +20,8 @@ Create GitHub environments named `staging` and `production`.
 Environment secrets:
 
 - `LEXYSIGN_DEPLOY_SSH_KEY` — private deploy key for the Hetzner host.
-- `VITE_SUPABASE_URL` — shared Lexy Supabase URL used at frontend build time.
-- `VITE_SUPABASE_ANON_KEY` — shared Lexy Supabase anon key used at frontend build time.
+
+Do not add frontend secrets as workflow build-args. `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` stay in the host `.env` and are consumed at container start by `docker-entrypoint.lexysign.sh`.
 
 Environment variables:
 
@@ -29,7 +29,7 @@ Environment variables:
 - `LEXYSIGN_DEPLOY_USER` — `root` unless a non-root deploy user is provisioned.
 - `LEXYSIGN_DEPLOY_PORT` — `22` unless SSH changes.
 
-The server runtime secrets stay in `.env` on the VPS and must not be committed. GitHub only gets the frontend Supabase build secrets and the SSH deploy credential.
+The server runtime secrets stay in `.env` on the VPS and must not be committed. GitHub does not receive frontend secret injection as Docker build-args; the client entrypoint still writes runtime-env.js from host `.env` `VITE_SUPABASE_*` values. SSH deploy credentials stay in the GitHub environment.
 
 ## VPS runtime files
 
@@ -54,12 +54,12 @@ The deploy workflow refuses to deploy an environment if its `.env` is missing.
 2. Merge to `staging`.
 3. Confirm staging loads and auth/billing boundaries behave correctly.
 4. Merge to `main`.
-5. Production deploy must show:
-   - both images pushed to GHCR;
-   - Hetzner `docker compose pull` and `up -d` completed;
-   - Caddy config validates and reloads;
+5. App deploy (see `docs/lexysign-app-release.md`) must show:
+   - both images pushed to GHCR with `org.opencontainers.image.revision` equal to the workflow SHA and tags pinned to `prod-<sha12>` / `staging-<sha12>`;
+   - Hetzner app-only `compose pull` / `up -d --no-deps server client` (no shared Caddy copy/reload/networks, no `--remove-orphans`, no Mongo recreate);
    - public URL returns a non-5xx response;
-   - `/api/billing/status` returns the expected unauthenticated `401` boundary.
+   - `/api/billing/status` returns the expected unauthenticated `401` boundary (5xx/unreachable is a failed deploy, not success).
+   Shared Caddy/edge remains a separate explicit operation. Staging requires a local Mailpit sink. Staging and production both require a real backup manifest before app replacement.
 
 ## Emergency break-glass
 

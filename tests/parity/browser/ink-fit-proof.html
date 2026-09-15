@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>ink-fit-proof</title></head>
+<body>
+<pre id="out">pending</pre>
+<script>
+async function convertBase64ToImg(base64Image, widgetDims, widgetType) {
+  const MAX_SRC_DIM = 4096;
+  const MAX_WIDGET_CSS = 2048;
+  const MAX_CANVAS_PX = 8192;
+  const LOAD_MS = 8000;
+  const SAFETY_PAD = 2;
+  const NEAR_WHITE = 250;
+  const NEAR_WHITE_CHROMA = 8;
+  const SPARSE_AREA = 0.5;
+  const TRIM_TYPES = { signature: true, initials: true, draw: true };
+
+  const fail = (reason) => {
+    throw new Error(`convertBase64ToImg: ${reason}`);
+  };
+
+  if (!widgetDims || typeof widgetDims !== "object") {
+    fail("invalid widget dimensions");
+  }
+  const maxWidth = Number(widgetDims.Width);
+  const maxHeight = Number(widgetDims.Height);
+  if (
+    !Number.isFinite(maxWidth) ||
+    !Number.isFinite(maxHeight) ||
+    maxWidth <= 0 ||
+    maxHeight <= 0 ||
+    maxWidth > MAX_WIDGET_CSS ||
+    maxHeight > MAX_WIDGET_CSS
+  ) {
+    fail("invalid widget dimensions");
+  }
+  if (typeof base64Image !== "string" || base64Image.length === 0) {
+    fail("invalid image");
+  }
+
+  const typeKey =
+    typeof widgetType === "string" ? widgetType.trim().toLowerCase() : "";
+  const trimToInk = Boolean(TRIM_TYPES[typeKey]);
+
+  const img = new Image();
+  const loaded = new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("convertBase64ToImg: image load timeout")),
+      LOAD_MS
+    );
+    img.onload = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("convertBase64ToImg: image load failed"));
+    };
+  });
+  img.src = base64Image;
+  await loaded;
+
+  const imgW = Number(img.naturalWidth || img.width);
+  const imgH = Number(img.naturalHeight || img.height);
+  if (
+    !Number.isFinite(imgW) ||
+    !Number.isFinite(imgH) ||
+    imgW < 1 ||
+    imgH < 1 ||
+    imgW > MAX_SRC_DIM ||
+    imgH > MAX_SRC_DIM
+  ) {
+    fail("invalid image dimensions");
+  }
+
+  let sx = 0;
+  let sy = 0;
+  let sw = imgW;
+  let sh = imgH;
+  let allowUpscale = false;
+
+  if (trimToInk) {
+    const measure = document.createElement("canvas");
+    measure.width = imgW;
+    measure.height = imgH;
+    const mctx = measure.getContext("2d");
+    if (!mctx) fail("canvas unsupported");
+    mctx.drawImage(img, 0, 0, imgW, imgH);
+    const { data } = mctx.getImageData(0, 0, imgW, imgH);
+    let minX = imgW;
+    let minY = imgH;
+    let maxX = -1;
+    let maxY = -1;
+    const count = imgW * imgH;
+    for (let i = 0; i < count; i += 1) {
+      const o = i * 4;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const a = data[o + 3];
+      if (a < 1) continue;
+      const maxc = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const minc = r < g ? (r < b ? r : b) : g < b ? g : b;
+      if (minc >= NEAR_WHITE && maxc - minc <= NEAR_WHITE_CHROMA) continue;
+      const x = i % imgW;
+      const y = (i / imgW) | 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+    if (maxX < minX) fail("no ink in image");
+    sx = Math.max(0, minX - SAFETY_PAD);
+    sy = Math.max(0, minY - SAFETY_PAD);
+    const ex = Math.min(imgW - 1, maxX + SAFETY_PAD);
+    const ey = Math.min(imgH - 1, maxY + SAFETY_PAD);
+    sw = ex - sx + 1;
+    sh = ey - sy + 1;
+    allowUpscale = (sw * sh) / (imgW * imgH) < SPARSE_AREA;
+  }
+
+  const scale = Math.min(
+    maxWidth / sw,
+    maxHeight / sh,
+    allowUpscale ? Number.POSITIVE_INFINITY : 1
+  );
+  if (!Number.isFinite(scale) || scale <= 0) fail("invalid scale");
+  const drawW = sw * scale;
+  const drawH = sh * scale;
+
+  const pxRatio = (window.devicePixelRatio || 1) * 2;
+  if (!Number.isFinite(pxRatio) || pxRatio <= 0) fail("invalid pixel ratio");
+  const canvasW = Math.ceil(maxWidth * pxRatio);
+  const canvasH = Math.ceil(maxHeight * pxRatio);
+  if (
+    !Number.isFinite(canvasW) ||
+    !Number.isFinite(canvasH) ||
+    canvasW < 1 ||
+    canvasH < 1 ||
+    canvasW > MAX_CANVAS_PX ||
+    canvasH > MAX_CANVAS_PX
+  ) {
+    fail("canvas size out of bounds");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasW;
+  canvas.height = canvasH;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) fail("canvas unsupported");
+  ctx.scale(pxRatio, pxRatio);
+  ctx.clearRect(0, 0, maxWidth, maxHeight);
+  const x = (maxWidth - drawW) / 2;
+  const y = (maxHeight - drawH) / 2;
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, drawW, drawH);
+  return canvas.toDataURL("image/png");
+}
+
+
+
+function syntheticSparse() {
+  const c = document.createElement("canvas");
+  c.width = 800;
+  c.height = 200;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, 800, 200);
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(360, 90, 80, 20);
+  return c.toDataURL("image/png");
+}
+
+async function convertBefore(base64Image, widgetDims) {
+  const { Width: maxWidth, Height: maxHeight } = widgetDims;
+  const img = new Image();
+  const loaded = new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+  });
+  img.src = base64Image;
+  await loaded;
+  const imgW = img.naturalWidth;
+  const imgH = img.naturalHeight;
+  const scale = Math.min(maxWidth / imgW, maxHeight / imgH, 1);
+  const drawW = imgW * scale;
+  const drawH = imgH * scale;
+  const pxRatio = (window.devicePixelRatio || 1) * 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(maxWidth * pxRatio);
+  canvas.height = Math.ceil(maxHeight * pxRatio);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(pxRatio, pxRatio);
+  ctx.clearRect(0, 0, maxWidth, maxHeight);
+  const x = (maxWidth - drawW) / 2;
+  const y = (maxHeight - drawH) / 2;
+  ctx.drawImage(img, x, y, drawW, drawH);
+  return canvas.toDataURL("image/png");
+}
+
+function measureInk(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height);
+      let minX = width, minY = height, maxX = -1, maxY = -1, count = 0;
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const a = data[(y * width + x) * 4 + 3];
+          if (a > 0) {
+            count += 1;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      resolve({
+        count,
+        minX,
+        minY,
+        maxX,
+        maxY,
+        bboxW: maxX >= minX ? maxX - minX + 1 : 0,
+        bboxH: maxY >= minY ? maxY - minY + 1 : 0,
+        width,
+        height
+      });
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
+(async () => {
+  const out = document.getElementById("out");
+  try {
+    const src = syntheticSparse();
+    const widget150 = { Width: 150, Height: 50 };
+    const widget271 = { Width: 271, Height: 50 };
+    const dpr = window.devicePixelRatio || 1;
+    const pxRatio = dpr * 2;
+    const before150 = await convertBefore(src, widget150);
+    const after150 = await convertBase64ToImg(src, widget150, "signature");
+    const after271 = await convertBase64ToImg(src, widget271, "signature");
+    const stamp150 = await convertBase64ToImg(src, widget150, "stamp");
+    const beforeStats = await measureInk(before150);
+    const afterStats = await measureInk(after150);
+    const after271Stats = await measureInk(after271);
+    const stampStats = await measureInk(stamp150);
+    const payload = {
+      ok: true,
+      userAgent: navigator.userAgent,
+      dpr,
+      pxRatio,
+      source: { width: 800, height: 200, ink: { x: 360, y: 90, w: 80, h: 20 } },
+      before150: {
+        cssInkH: beforeStats.bboxH / pxRatio,
+        cssInkW: beforeStats.bboxW / pxRatio,
+        heightFill: beforeStats.bboxH / pxRatio / 50,
+        stats: beforeStats
+      },
+      after150: {
+        cssInkH: afterStats.bboxH / pxRatio,
+        cssInkW: afterStats.bboxW / pxRatio,
+        heightFill: afterStats.bboxH / pxRatio / 50,
+        stats: afterStats
+      },
+      after271: {
+        cssInkH: after271Stats.bboxH / pxRatio,
+        cssInkW: after271Stats.bboxW / pxRatio,
+        heightFill: after271Stats.bboxH / pxRatio / 50,
+        stats: after271Stats
+      },
+      stamp150: {
+        cssInkH: stampStats.bboxH / pxRatio,
+        heightFill: stampStats.bboxH / pxRatio / 50,
+        stats: stampStats
+      },
+      beforePng: before150,
+      afterPng: after150
+    };
+    out.textContent = JSON.stringify(payload);
+  } catch (err) {
+    out.textContent = JSON.stringify({ ok: false, error: String(err && err.stack || err) });
+  }
+})();
+</script>
+</body>
+</html>

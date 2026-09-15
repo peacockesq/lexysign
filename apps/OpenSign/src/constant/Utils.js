@@ -1,12 +1,20 @@
 import axios from "axios";
 import moment from "moment";
-import { PDFDocument, rgb, degrees } from "pdf-lib";
+import {
+  PDFDocument,
+  rgb,
+  degrees,
+  PDFName,
+  StandardFonts,
+  PDFArray,
+  PDFDict
+} from "pdf-lib";
 import Parse from "parse";
 import { appInfo } from "./appinfo";
 import { saveAs } from "file-saver";
 import printModule from "print-js";
 import fontkit from "@pdf-lib/fontkit";
-import { themeColor } from "./const";
+import { SCALE_STEPS, themeColor } from "./const";
 import { format, toZonedTime } from "date-fns-tz";
 import i18n from "../i18n";
 import {
@@ -26,6 +34,86 @@ export const drawWidget = "draw";
 export const textWidget = "text";
 export const radioButtonWidget = "radio button";
 export const cellsWidget = "cells";
+const duplicateAutoApplyWidgetTypes = [
+  "name",
+  "company",
+  "job title",
+  "email",
+  textInputWidget
+];
+const normalizeDuplicateWidgetType = (type) => {
+  if (typeof type !== "string") {
+    return type;
+  }
+  const normalizedType = type.trim().toLowerCase();
+  // Backward compatibility for legacy payloads.
+  if (normalizedType === "textbox") {
+    return textInputWidget;
+  }
+  return normalizedType;
+};
+const normalizeDuplicateWidgetName = (name) =>
+  typeof name === "string" ? name.trim().toLowerCase() : "";
+const isDuplicateAutoApplyWidget = (widget) =>
+  duplicateAutoApplyWidgetTypes.includes(
+    normalizeDuplicateWidgetType(widget?.type)
+  );
+const getDuplicateAutoApplyName = (widget) => {
+  if (!isDuplicateAutoApplyWidget(widget)) {
+    return "";
+  }
+  return normalizeDuplicateWidgetName(widget?.options?.name);
+};
+const getWidgetResponseValue = (widget) =>
+  widget?.options?.response ?? widget?.options?.defaultValue;
+const getDuplicateResponseMap = (widgets = []) => {
+  const responseByName = new Map();
+  widgets.forEach((widget) => {
+    const widgetName = getDuplicateAutoApplyName(widget);
+    const response = getWidgetResponseValue(widget);
+    if (
+      widgetName &&
+      response !== undefined &&
+      response !== "" &&
+      !responseByName.has(widgetName)
+    ) {
+      responseByName.set(widgetName, response);
+    }
+  });
+  return responseByName;
+};
+const applyDuplicateResponsesToWidgets = (
+  widgets = [],
+  responseByName = getDuplicateResponseMap(widgets)
+) => {
+  if (responseByName.size === 0) {
+    return widgets;
+  }
+
+  return widgets.map((widget) => {
+    const widgetName = getDuplicateAutoApplyName(widget);
+    if (!widgetName || !responseByName.has(widgetName)) {
+      return widget;
+    }
+    return {
+      ...widget,
+      options: {
+        ...widget.options,
+        response: responseByName.get(widgetName),
+        defaultValue: ""
+      }
+    };
+  });
+};
+const applyDuplicateResponsesToPages = (pages = []) => {
+  const responseByName = getDuplicateResponseMap(
+    pages.flatMap((page) => page?.pos || [])
+  );
+  return pages.map((page) => ({
+    ...page,
+    pos: applyDuplicateResponsesToWidgets(page?.pos || [], responseByName)
+  }));
+};
 export function getEnv() {
   return window?.RUNTIME_ENV || {};
 }
@@ -108,7 +196,7 @@ export const getUserCountry = async () => {
 
 // `getSecureUrl` is used to return local secure url if local files
 export const getSecureUrl = async (url) => {
-  const fileUrl = new URL(url)?.pathname?.includes("files");
+  const fileUrl = new URL(url)?.pathname?.includes("/files/");
   if (fileUrl) {
     try {
       const fileRes = await Parse.Cloud.run("fileupload", { url: url });
@@ -268,23 +356,21 @@ export const contractUsers = async () => {
 };
 
 //function for resize image and update width and height for mulitisigners
-export const handleImageResize = (
+export const handleWidgetResize = (
   ref,
   key,
   signerPos,
   setSignerPos,
   pageNumber,
   containerScale,
-  scale,
   signerId,
   showResize
 ) => {
   // Compute widget dimensions only once
   const { offsetWidth, offsetHeight } = ref;
-  const factor = scale * containerScale || 1;
+  const factor = containerScale || 1;
   const widgetWidth = offsetWidth / factor;
   const widgetHeight = offsetHeight / factor;
-  const widgetDims = { Width: widgetWidth, Height: widgetHeight };
 
   const filterSignerPos = signerPos.filter((data) => data.Id === signerId);
   if (filterSignerPos.length > 0) {
@@ -297,11 +383,18 @@ export const handleImageResize = (
       const getPosData = getXYdata;
       const addSignPos = getPosData.map((url) => {
         if (url.key === key) {
+          // For rotated widgets (90°/270°), the visual dimensions are swapped.
+          // Store the original-orientation dimensions in the data model.
+          const rotation = url.options?.rotation || 0;
+          const isRotSwapped = [90, 270].includes(rotation);
+          const storedWidth = isRotSwapped ? widgetHeight : widgetWidth;
+          const storedHeight = isRotSwapped ? widgetWidth : widgetHeight;
+          const widgetDims = { Width: storedWidth, Height: storedHeight };
           // Base fields for every resized signature
           const base = {
             ...url,
-            Width: widgetWidth,
-            Height: widgetHeight,
+            Width: storedWidth,
+            Height: storedHeight,
             IsResize: showResize ? true : false
           };
           // If it's a “type” signature, regenerate the image and options
@@ -745,14 +838,13 @@ export const convertPNGtoJPEG = (base64Data) => {
 };
 
 //function for resize image and update width and height for sign-yourself
-export const handleSignYourselfImageResize = (
+export const handleSignYourselfWidgetResize = (
   ref,
   key,
   xyPosition,
   setXyPosition,
   index,
-  containerScale,
-  scale
+  containerScale
 ) => {
   // Guard against bad index
   if (!xyPosition[index]) {
@@ -762,10 +854,9 @@ export const handleSignYourselfImageResize = (
 
   // Compute widget dimensions only once
   const { offsetWidth, offsetHeight } = ref;
-  const factor = scale * containerScale || 1;
+  const factor = containerScale || 1;
   const widgetWidth = offsetWidth / factor;
   const widgetHeight = offsetHeight / factor;
-  const widgetDims = { Width: widgetWidth, Height: widgetHeight };
 
   // Single pass to update only the targeted index/key
   const updated = xyPosition.map((item, idx) => {
@@ -776,11 +867,19 @@ export const handleSignYourselfImageResize = (
       pos: item.pos.map((url) => {
         if (url.key !== key) return url;
 
+        // For rotated widgets (90°/270°), the visual dimensions are swapped.
+        // Store the original-orientation dimensions in the data model.
+        const rotation = url.options?.rotation || 0;
+        const isRotSwapped = [90, 270].includes(rotation);
+        const storedWidth = isRotSwapped ? widgetHeight : widgetWidth;
+        const storedHeight = isRotSwapped ? widgetWidth : widgetHeight;
+        const widgetDims = { Width: storedWidth, Height: storedHeight };
+
         // Base fields for every resized signature
         const base = {
           ...url,
-          Width: widgetWidth,
-          Height: widgetHeight,
+          Width: storedWidth,
+          Height: storedHeight,
           IsResize: true
         };
 
@@ -813,7 +912,8 @@ export const signPdfFun = async (
   documentId,
   signerObjectId,
   objectId,
-  widgets
+  widgets,
+  activity
 ) => {
   let isCustomCompletionMail = false;
   try {
@@ -841,27 +941,31 @@ export const signPdfFun = async (
     }
 
     let base64Sign = getSignature?.SignUrl;
-    //check https type signature (default signature exist) then convert in base64
-    const isUrl = base64Sign.includes("https");
-    if (isUrl) {
-      try {
-        base64Sign = await fetchImageBase64(base64Sign);
-      } catch (e) {
-        console.log("error", e);
-        return { status: "error", message: "something went wrong." };
+    let suffixbase64 = "";
+    if (base64Sign) {
+      //check https type signature (default signature exist) then convert in base64
+      const isUrl = base64Sign.includes("https");
+      if (isUrl) {
+        try {
+          base64Sign = await fetchImageBase64(base64Sign);
+        } catch (e) {
+          console.log("error", e);
+          return { status: "error", message: "something went wrong." };
+        }
       }
+      //change image width and height to 300/120 in png base64
+      const imagebase64 = await changeImageWH(base64Sign);
+      //remove suffiix of base64 (without type)
+      suffixbase64 = imagebase64 && imagebase64.split(",").pop();
     }
-    //change image width and height to 300/120 in png base64
-    const imagebase64 = await changeImageWH(base64Sign);
-    //remove suffiix of base64 (without type)
-    const suffixbase64 = imagebase64 && imagebase64.split(",").pop();
 
     const params = {
       pdfFile: base64Url,
       docId: documentId,
       userId: signerObjectId,
       isCustomCompletionMail: isCustomCompletionMail,
-      signature: suffixbase64
+      signature: suffixbase64,
+      activity: activity || "Signed"
     };
     const resSignPdf = await Parse.Cloud.run("signPdf", params);
     if (resSignPdf) {
@@ -877,6 +981,11 @@ export const signPdfFun = async (
       };
     } else if (e?.message?.includes("password")) {
       return { status: "error", message: "PFX file password is invalid." };
+    } else if (
+      e?.code === 119 ||
+      e?.message?.toLowerCase?.().includes("strict signing order")
+    ) {
+      return { status: "error", message: e.message };
     } else {
       return { status: "error", message: "something went wrong." };
     }
@@ -938,6 +1047,7 @@ export const createDocument = async (
         ? { NotifyOnSignatures: Doc?.NotifyOnSignatures }
         : {};
     const Bcc = Doc?.Bcc?.length > 0 ? { Bcc: Doc?.Bcc } : {};
+    const Cc = Doc?.Cc?.length > 0 ? { Cc: Doc?.Cc } : {};
     const RedirectUrl = Doc?.RedirectUrl
       ? { RedirectUrl: Doc?.RedirectUrl }
       : {};
@@ -971,6 +1081,7 @@ export const createDocument = async (
       AutomaticReminders: Doc?.AutomaticReminders || false,
       RemindOnceInEvery: parseInt(Doc?.RemindOnceInEvery || 5),
       IsEnableOTP: Doc?.IsEnableOTP || false,
+      SendInOrderStrict: Doc?.SendInOrderStrict || false,
       IsTourEnabled: Doc?.IsTourEnabled || false,
       AllowModifications: Doc?.AllowModifications || false,
       TimeToCompleteDays: parseInt(Doc?.TimeToCompleteDays) || 15,
@@ -980,6 +1091,7 @@ export const createDocument = async (
       ...SenderName,
       ...SenderMail,
       ...Bcc,
+      ...Cc,
       ...RedirectUrl,
       ...TemplateId,
       ...PenColors
@@ -991,20 +1103,24 @@ export const createDocument = async (
     if (AutomaticReminders && reminderCount > 15) {
       return { status: "error", id: "only-15-reminder-allowed" };
     }
-    const url = `${localStorage.getItem("baseUrl")}classes/contracts_Document`;
+    const url = `${localStorage.getItem("baseUrl")}functions/createdocumentfromapp`;
     const token = {
       "X-Parse-Session-Token": localStorage.getItem("accesstoken")
     };
     try {
-      const res = await axios.post(url, data, {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
-          ...token
+      const res = await axios.post(
+        url,
+        { document: data },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
+            ...token
+          }
         }
-      });
+      );
       if (res) {
-        const result = res.data;
+        const result = res.data.result;
 
         return { status: "success", id: result.objectId, data: result };
       }
@@ -1084,6 +1200,28 @@ export const onChangeInput = (
   dateDetails,
   textWidgetHeight
 ) => {
+  const isDuplicateValueUpdate = !dateFormat && !textWidgetHeight;
+  const shouldAutoApplyDuplicateWidget = (position) => {
+    const currentName = getDuplicateAutoApplyName(currentPosition);
+    const positionName = getDuplicateAutoApplyName(position);
+    return currentName && positionName && currentName === positionName;
+  };
+  const applyDuplicateWidgetValue = (position) => {
+    if (
+      position?.options?.response === value &&
+      position?.options?.defaultValue === ""
+    ) {
+      return position;
+    }
+    return {
+      ...position,
+      options: {
+        ...position.options,
+        response: value,
+        defaultValue: ""
+      }
+    };
+  };
   const isSigners = xyPosition.some(
     (data) => data.signerPtr || data.Role === "prefill"
   );
@@ -1101,8 +1239,7 @@ export const onChangeInput = (
         (data) => data.pageNumber === index
       );
       if (getPageNumer.length > 0) {
-        const getXYdata = getPageNumer[0].pos;
-        const addSignPos = getXYdata.map((position) => {
+        const updatePositionValue = (position) => {
           if (position.key === currentPosition.key) {
             if (dateFormat) {
               return {
@@ -1139,45 +1276,41 @@ export const onChangeInput = (
               textWidgetHeight &&
               !value
             ) {
-              return {
-                ...position,
-                Height: textWidgetHeight
-              };
+              return { ...position, Height: textWidgetHeight };
             } else {
-              return {
-                ...position,
-                options: {
-                  ...position.options,
-                  response: value,
-                  defaultValue: ""
-                }
-              };
+              return applyDuplicateWidgetValue(position);
             }
           }
+          if (
+            isDuplicateValueUpdate &&
+            shouldAutoApplyDuplicateWidget(position)
+          ) {
+            return applyDuplicateWidgetValue(position);
+          }
           return position;
+        };
+        setXyPosition((prevPosition) => {
+          const sourcePosition = Array.isArray(prevPosition)
+            ? prevPosition
+            : xyPosition;
+          return sourcePosition.map((obj) => {
+            if (obj.Id !== userId) {
+              return obj;
+            }
+            const updatedPlaceHolder = (obj.placeHolder || []).map((page) => ({
+              ...page,
+              pos: page.pos.map(updatePositionValue)
+            }));
+            return {
+              ...obj,
+              placeHolder: applyNumberFormulasToPages(updatedPlaceHolder)
+            };
+          });
         });
-        const newUpdateSignPos = getPlaceHolder.map((obj) => {
-          if (obj.pageNumber === index) {
-            return { ...obj, pos: addSignPos };
-          }
-          return obj;
-        });
-
-        const recalculatedPages = applyNumberFormulasToPages(newUpdateSignPos);
-
-        const newUpdateSigner = xyPosition.map((obj) => {
-          if (obj.Id === userId) {
-            return { ...obj, placeHolder: recalculatedPages };
-          }
-          return obj;
-        });
-
-        setXyPosition(newUpdateSigner);
       }
     }
   } else {
-    let getXYdata = xyPosition[index].pos;
-    const updatePosition = getXYdata.map((positionData) => {
+    const updatePositionValue = (positionData) => {
       if (positionData.key === currentPosition.key) {
         if (dateFormat) {
           return {
@@ -1198,31 +1331,30 @@ export const onChangeInput = (
           textWidgetHeight &&
           !value
         ) {
-          return {
-            ...positionData,
-            Height: textWidgetHeight
-          };
+          return { ...positionData, Height: textWidgetHeight };
         } else {
-          return {
-            ...positionData,
-            options: {
-              ...positionData.options,
-              response: value,
-              defaultValue: ""
-            }
-          };
+          return applyDuplicateWidgetValue(positionData);
         }
       }
-      return positionData;
-    });
-
-    const updatePlaceholder = xyPosition.map((obj, ind) => {
-      if (ind === index) {
-        return { ...obj, pos: updatePosition };
+      if (
+        isDuplicateValueUpdate &&
+        shouldAutoApplyDuplicateWidget(positionData)
+      ) {
+        return applyDuplicateWidgetValue(positionData);
       }
-      return obj;
+      return positionData;
+    };
+
+    setXyPosition((prevPosition) => {
+      const sourcePosition = Array.isArray(prevPosition)
+        ? prevPosition
+        : xyPosition;
+      const updatePlaceholder = sourcePosition.map((obj) => ({
+        ...obj,
+        pos: obj.pos.map(updatePositionValue)
+      }));
+      return applyNumberFormulasToPages(updatePlaceholder);
     });
-    setXyPosition(applyNumberFormulasToPages(updatePlaceholder));
   }
 };
 //function to increase height of text area on press enter
@@ -1578,44 +1710,168 @@ export function clearResponse(widgetKey, placeholder = [], index) {
  * Scales and centers a base64‐encoded image into a fixed‐size widget
  * and returns a new base64 PNG.
  *
+ * Drawn signature/initials/draw widgets crop non-ink padding (transparent
+ * pixels, including leftover RGB at alpha 0, and conservative near-white
+ * upload backgrounds) before fitting. Stamp/image/unknown types keep the
+ * full bitmap and the historical no-upscale policy.
+ *
+ * Sparse cropped ink may be scaled up to fill the widget (aspect preserved).
+ * Filled sources that already occupy the bitmap keep no-upscale.
+ *
  * @param {string} base64Image  A data-URL (e.g. "data:image/png;base64,…")
  * @param {{ Width: number, Height: number }} widgetDims
+ * @param {string} [widgetType]
  * @returns {Promise<string>}  A Promise that resolves to a data-URL of the new image
  */
-export async function convertBase64ToImg(base64Image, widgetDims) {
-  const { Width: maxWidth, Height: maxHeight } = widgetDims;
-  // Load the image off-DOM
+export async function convertBase64ToImg(base64Image, widgetDims, widgetType) {
+  const MAX_SRC_DIM = 4096;
+  const MAX_WIDGET_CSS = 2048;
+  const MAX_CANVAS_PX = 8192;
+  const LOAD_MS = 8000;
+  const SAFETY_PAD = 2;
+  const NEAR_WHITE = 250;
+  const NEAR_WHITE_CHROMA = 8;
+  const SPARSE_AREA = 0.5;
+  const TRIM_TYPES = { signature: true, initials: true, draw: true };
+
+  const fail = (reason) => {
+    throw new Error(`convertBase64ToImg: ${reason}`);
+  };
+
+  if (!widgetDims || typeof widgetDims !== "object") {
+    fail("invalid widget dimensions");
+  }
+  const maxWidth = Number(widgetDims.Width);
+  const maxHeight = Number(widgetDims.Height);
+  if (
+    !Number.isFinite(maxWidth) ||
+    !Number.isFinite(maxHeight) ||
+    maxWidth <= 0 ||
+    maxHeight <= 0 ||
+    maxWidth > MAX_WIDGET_CSS ||
+    maxHeight > MAX_WIDGET_CSS
+  ) {
+    fail("invalid widget dimensions");
+  }
+  if (typeof base64Image !== "string" || base64Image.length === 0) {
+    fail("invalid image");
+  }
+
+  const typeKey =
+    typeof widgetType === "string" ? widgetType.trim().toLowerCase() : "";
+  const trimToInk = Boolean(TRIM_TYPES[typeKey]);
+
   const img = new Image();
-  img.src = base64Image;
-  await new Promise((resolve, reject) => {
-    img.onload = resolve;
-    img.onerror = reject;
+  const loaded = new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("convertBase64ToImg: image load timeout")),
+      LOAD_MS
+    );
+    img.onload = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("convertBase64ToImg: image load failed"));
+    };
   });
+  img.src = base64Image;
+  await loaded;
 
-  // 2. Compute scale to fit within widget (preserving aspect ratio)
-  const { naturalWidth: imgW, naturalHeight: imgH } = img;
-  const scale = Math.min(maxWidth / imgW, maxHeight / imgH, 1);
-  const drawW = imgW * scale;
-  const drawH = imgH * scale;
+  const imgW = Number(img.naturalWidth || img.width);
+  const imgH = Number(img.naturalHeight || img.height);
+  if (
+    !Number.isFinite(imgW) ||
+    !Number.isFinite(imgH) ||
+    imgW < 1 ||
+    imgH < 1 ||
+    imgW > MAX_SRC_DIM ||
+    imgH > MAX_SRC_DIM
+  ) {
+    fail("invalid image dimensions");
+  }
 
-  // 3. Prepare a high-DPI canvas
+  let sx = 0;
+  let sy = 0;
+  let sw = imgW;
+  let sh = imgH;
+  let allowUpscale = false;
+
+  if (trimToInk) {
+    const measure = document.createElement("canvas");
+    measure.width = imgW;
+    measure.height = imgH;
+    const mctx = measure.getContext("2d");
+    if (!mctx) fail("canvas unsupported");
+    mctx.drawImage(img, 0, 0, imgW, imgH);
+    const { data } = mctx.getImageData(0, 0, imgW, imgH);
+    let minX = imgW;
+    let minY = imgH;
+    let maxX = -1;
+    let maxY = -1;
+    const count = imgW * imgH;
+    for (let i = 0; i < count; i += 1) {
+      const o = i * 4;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const a = data[o + 3];
+      if (a < 1) continue;
+      const maxc = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const minc = r < g ? (r < b ? r : b) : g < b ? g : b;
+      if (minc >= NEAR_WHITE && maxc - minc <= NEAR_WHITE_CHROMA) continue;
+      const x = i % imgW;
+      const y = (i / imgW) | 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+    if (maxX < minX) fail("no ink in image");
+    sx = Math.max(0, minX - SAFETY_PAD);
+    sy = Math.max(0, minY - SAFETY_PAD);
+    const ex = Math.min(imgW - 1, maxX + SAFETY_PAD);
+    const ey = Math.min(imgH - 1, maxY + SAFETY_PAD);
+    sw = ex - sx + 1;
+    sh = ey - sy + 1;
+    allowUpscale = (sw * sh) / (imgW * imgH) < SPARSE_AREA;
+  }
+
+  const scale = Math.min(
+    maxWidth / sw,
+    maxHeight / sh,
+    allowUpscale ? Number.POSITIVE_INFINITY : 1
+  );
+  if (!Number.isFinite(scale) || scale <= 0) fail("invalid scale");
+  const drawW = sw * scale;
+  const drawH = sh * scale;
+
   const pxRatio = (window.devicePixelRatio || 1) * 2;
+  if (!Number.isFinite(pxRatio) || pxRatio <= 0) fail("invalid pixel ratio");
+  const canvasW = Math.ceil(maxWidth * pxRatio);
+  const canvasH = Math.ceil(maxHeight * pxRatio);
+  if (
+    !Number.isFinite(canvasW) ||
+    !Number.isFinite(canvasH) ||
+    canvasW < 1 ||
+    canvasH < 1 ||
+    canvasW > MAX_CANVAS_PX ||
+    canvasH > MAX_CANVAS_PX
+  ) {
+    fail("canvas size out of bounds");
+  }
+
   const canvas = document.createElement("canvas");
-  canvas.width = Math.ceil(maxWidth * pxRatio);
-  canvas.height = Math.ceil(maxHeight * pxRatio);
+  canvas.width = canvasW;
+  canvas.height = canvasH;
   const ctx = canvas.getContext("2d");
+  if (!ctx) fail("canvas unsupported");
   ctx.scale(pxRatio, pxRatio);
   ctx.clearRect(0, 0, maxWidth, maxHeight);
-
-  // 4. Center the image in the widget rectangle
   const x = (maxWidth - drawW) / 2;
   const y = (maxHeight - drawH) / 2;
-  ctx.drawImage(img, x, y, drawW, drawH);
-  // 5. Return new base64 in same format as input
-  // const quality =
-  //   inputMime.includes("jpeg") || inputMime.includes("jpg") ? 0.9 : undefined;
-  // return canvas.toDataURL(inputMime, quality);
-  // 5. Always return PNG (lossless, no quality param needed)
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, drawW, drawH);
   return canvas.toDataURL("image/png");
 }
 
@@ -1694,13 +1950,14 @@ export function onSaveImage(
   defaultStampImg,
   defaultStampType
 ) {
-  // let getIMGWH;
+  let widgetName;
   const isSignOrInitials =
     widgetsType && ["signature", "initials"].includes(widgetsType);
   //get current page position
   const getXYData = xyPosition[index].pos;
   const updateXYData = getXYData.map((position) => {
     if (position.key === signKey) {
+      widgetName = position?.options?.name;
       return {
         ...position,
         SignUrl: imgUrl || image?.src || defaultStampImg,
@@ -1720,14 +1977,17 @@ export function onSaveImage(
     }
     return obj;
   });
-  // condition when user upload(stamp) then apply it all related to widgets
+
+  // condition when user apply auto sign feature for any type upload image (signature,initials,stamp,image)
   if (isAutoSign) {
     const updatedArray = updateXYposition.map((page) => ({
       ...page,
       pos: page.pos.map(
         (item) =>
-          // below condition to exclude apply all for image widget
-          item.type === widgetsType // && item.type !== "image"
+          // below condition is check if image widget name same then apply to auto sign other wise not
+          // and for other widget like signature,stamp,initials apply auto sign for all remaining widgets
+          item.type === widgetsType &&
+          (item.type !== "image" || item.options.name === widgetName)
             ? {
                 ...item,
                 SignUrl: image?.src || defaultStampImg,
@@ -1988,7 +2248,8 @@ export const embedWidgetsToDoc = async (
             // const mime = arr[0].match(/:(.*?);/)[1];
             const signatureImg = await convertBase64ToImg(
               signbase64,
-              widgetDims
+              widgetDims,
+              widget.type
             );
             const mime = signatureImg?.split(",")?.[0]?.match(/:(.*?);/)?.[1];
             const res = await fetch(signatureImg);
@@ -2076,7 +2337,7 @@ export const embedWidgetsToDoc = async (
           // Size and spacing settings
           const checkboxSize = fontSize - 1; // checkbox diameter
           const checkboxTextGapFromLeft = fontSize + 3.4; // gap between box and its label
-          const verticalGap = fontSize + 3.4; // gap between two rows (vertical layout)
+          const verticalGap = fontSize + 5.5; // gap between two options (vertical layout)
           let horizontalGap = 0; // will compute after drawing each label
           if (position?.options?.values?.length > 0) {
             position.options.values.forEach((item, ind) => {
@@ -2326,8 +2587,8 @@ export const embedWidgetsToDoc = async (
           // Initial “cursor” positions (from your existing helpers)
           let currentX = xPos(position) + 2;
           let currentY = yPos(position) + 3;
-          // Vertical gap between two radio‐rows
-          const verticalGap = fontSize + 3;
+          // Vertical gap between two options
+          const verticalGap = fontSize + 5;
           // We’ll compute horizontalGap on the fly—after drawing each label
           // Initialize to zero (will be set after first option is placed)
           let horizontalGap = 0;
@@ -2406,13 +2667,39 @@ export const embedWidgetsToDoc = async (
           // 6. Set to read‐only (if required)
           radioGroup.enableReadOnly();
         } else {
+          const widgetRotation = position?.options?.rotation || 0;
+          const isSwapped = [90, 270].includes(widgetRotation);
+          // Use visual (swapped) dimensions to compute the correct position
           const signature = {
             x: xPos(position),
             y: yPos(position),
-            width: widgetWidth,
-            height: widgetHeight
+            width: isSwapped ? widgetHeight : widgetWidth,
+            height: isSwapped ? widgetWidth : widgetHeight
           };
           const imageOptions = getWidgetPosition(page, signature, 1, getSize);
+          if (widgetRotation) {
+            const pageRotation = page.getRotation().angle;
+            const combinedRotation = degrees(
+              (imageOptions.rotate?.angle || pageRotation) - widgetRotation
+            );
+            const visualWidth = imageOptions.width;
+            const visualHeight = imageOptions.height;
+            if (isSwapped) {
+              // Override with original (unswapped) dimensions for the actual image
+              imageOptions.width = visualHeight;
+              imageOptions.height = visualWidth;
+            }
+            imageOptions.rotate = combinedRotation;
+            // Adjust position to compensate for pdf-lib rotation pivot (bottom-left corner)
+            if (widgetRotation === 90) {
+              imageOptions.y += visualHeight;
+            } else if (widgetRotation === 180) {
+              imageOptions.x += imageOptions.width;
+              imageOptions.y += imageOptions.height;
+            } else if (widgetRotation === 270) {
+              imageOptions.x += visualWidth;
+            }
+          }
           page.drawImage(img, imageOptions);
         }
       } catch (err) {
@@ -3268,19 +3555,52 @@ export const convertBase64ToFile = async (pdfName, pdfBase64, imgType) => {
     console.log("error in convertbase64tofile", e);
   }
 };
-export const onClickZoomIn = (zoomPercent, setScale, setZoomPercent) => {
-  const newPercent = zoomPercent + 10;
-  setZoomPercent(newPercent);
-  setScale(1 + newPercent / 100);
-};
-export const onClickZoomOut = (zoomPercent, setZoomPercent, setScale) => {
-  if (zoomPercent > 0) {
-    const newPercent = Math.max(0, zoomPercent - 10);
-    setZoomPercent(newPercent);
-    setScale(1 + newPercent / 100);
-  }
+
+// Shared ref that holds a pending scroll restore job for button zoom.
+// RenderPdf reads this in its scale-change useEffect (same pattern as pinch).
+export const pendingButtonZoomScrollRef = { current: null };
+
+/**
+ * Call this with the scroll container ref so the zoom utils can snapshot
+ * the current scroll position BEFORE setScale triggers a re-render.
+ *
+ * Anchors zoom to the visible center of the viewport, so the page content
+ * under your eyes stays in place rather than jumping to the top.
+ */
+const captureScrollForButtonZoom = (scrollContainerRef, scale, newScale) => {
+  const el = scrollContainerRef?.current;
+  if (!el) return;
+
+  const scaleRatio = newScale / scale;
+
+  // Anchor point = center of the visible scroll container
+  const midRelX = el.clientWidth / 2;
+  const midRelY = el.clientHeight / 2;
+
+  const docX = el.scrollLeft + midRelX;
+  const docY = el.scrollTop + midRelY;
+
+  const newScrollLeft = Math.max(0, docX * scaleRatio - midRelX);
+  const newScrollTop = Math.max(0, docY * scaleRatio - midRelY);
+
+  pendingButtonZoomScrollRef.current = { newScrollLeft, newScrollTop };
 };
 
+export const onClickZoomIn = (scale, setScale, scrollContainerRef) => {
+  // Find last step smaller than current scale
+  const nextScale = SCALE_STEPS.find((s) => s > scale);
+  if (!nextScale) return;
+  captureScrollForButtonZoom(scrollContainerRef, scale, nextScale);
+  setScale(nextScale);
+};
+
+export const onClickZoomOut = (scale, setScale, scrollContainerRef) => {
+  // Find last step smaller than current scale
+  const prevScale = [...SCALE_STEPS].reverse().find((s) => s < scale);
+  if (!prevScale || prevScale < 1.0) return;
+  captureScrollForButtonZoom(scrollContainerRef, scale, prevScale);
+  setScale(prevScale);
+};
 //function to use remove widgets from current page when user want to rotate page
 export const handleRemoveWidgets = (
   setSignerPos,
@@ -3527,36 +3847,503 @@ export const handleHeighlightWidget = (
   return updateZindex;
 };
 /**
- * FlattenPdf is used to remove existing widgets if present any and flatten pdf.
+ * FlattenPdf renders field values as static content and removes the interactive
+ * form layer. Signatures are stripped entirely. Non-widget annotations (links,
+ * comments, stamps) are preserved.
  * @param {string | Uint8Array | ArrayBuffer} pdfFile - pdf file.
- * @returns {Promise<Uint8Array>} flatPdf - pdf file in unit8arry
+ * @returns {Promise<Uint8Array>} flatPdf - PDF file in Uint8Array
  */
 export const flattenPdf = async (pdfFile) => {
-  const pdfDoc = await PDFDocument.load(pdfFile);
-  // Get the form
-  const form = pdfDoc.getForm();
-  // fetch form fields
+  const pdfDoc = await PDFDocument.load(pdfFile, { ignoreEncryption: true });
+
+  let form;
+  try {
+    form = pdfDoc.getForm();
+  } catch {
+    // No form, nothing to flatten
+    return await pdfDoc.save({ useObjectStreams: false });
+  }
+
+  const pages = pdfDoc.getPages();
+
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const zapf = await pdfDoc.embedFont(StandardFonts.ZapfDingbats);
+
   const fields = form.getFields();
-  // remove form all existing fields and their widgets
-  if (fields && fields?.length > 0) {
-    try {
-      for (const field of fields) {
-        while (field.acroField.getWidgets().length) {
-          field.acroField.removeWidget(0);
-        }
-        form.removeField(field);
+
+  for (const field of fields) {
+    const type = field.constructor.name;
+
+    if (type === "PDFSignature") {
+      continue;
+    }
+
+    const widgets = _safeGetWidgets(field);
+
+    for (const widget of widgets) {
+      const rect = _getWidgetRect(widget, pdfDoc);
+      const page = _getWidgetPage(pdfDoc, pages, widget);
+
+      if (!rect || !page) continue;
+
+      _drawWidgetBox(page, rect);
+
+      if (type === "PDFTextField") {
+        _drawTextField(page, field, rect, helvetica);
+      } else if (type === "PDFCheckBox") {
+        _drawCheckBox(page, field, rect, zapf);
+      } else if (type === "PDFRadioGroup") {
+        _drawRadioGroup(page, field, widget, rect);
+      } else if (type === "PDFDropdown") {
+        _drawDropdown(page, field, rect, helvetica);
+      } else if (type === "PDFOptionList") {
+        _drawOptionList(page, field, rect, helvetica);
+      } else if (type === "PDFButton") {
+        // Push buttons are interactive controls, not meaningful data fields.
       }
-    } catch (err) {
-      console.log("err while removing field from pdf", err);
     }
   }
-  // Updates the field appearances to ensure visual changes are reflected.
-  form.updateFieldAppearances();
-  // Flattens the form, converting all form fields into non-editable, static content
-  form.flatten();
-  const flatPdf = await pdfDoc.save({ useObjectStreams: false });
-  return flatPdf;
+
+  if (fields.length > 0) {
+    _removeWidgetAnnotations(pdfDoc);
+  }
+
+  return await pdfDoc.save({ useObjectStreams: false });
 };
+
+/* ---- flattenPdf private helpers ---- */
+
+function _safeGetWidgets(field) {
+  try {
+    return field.acroField?.getWidgets?.() || [];
+  } catch {
+    return [];
+  }
+}
+
+function _getWidgetRect(widget, pdfDoc) {
+  try {
+    const r = widget.getRectangle?.();
+    if (
+      r &&
+      isFinite(r.x) &&
+      isFinite(r.y) &&
+      isFinite(r.width) &&
+      isFinite(r.height)
+    ) {
+      return r;
+    }
+  } catch {
+    /* fall through to manual extraction */
+  }
+
+  try {
+    const rectArr = widget.dict?.lookup?.(PDFName.of("Rect"));
+    if (!rectArr || typeof rectArr.size !== "function" || rectArr.size() !== 4)
+      return null;
+
+    const x1 = _numberFromPdfObject(rectArr.get(0));
+    const y1 = _numberFromPdfObject(rectArr.get(1));
+    const x2 = _numberFromPdfObject(rectArr.get(2));
+    const y2 = _numberFromPdfObject(rectArr.get(3));
+
+    if ([x1, y1, x2, y2].some((v) => !isFinite(v))) return null;
+
+    return {
+      x: Math.min(x1, x2),
+      y: Math.min(y1, y2),
+      width: Math.abs(x2 - x1),
+      height: Math.abs(y2 - y1)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function _numberFromPdfObject(obj) {
+  if (!obj) return NaN;
+  if (typeof obj.asNumber === "function") return obj.asNumber();
+  if (typeof obj.numberValue === "function") return obj.numberValue();
+  return Number(obj?.value ?? obj);
+}
+
+function _getWidgetPage(pdfDoc, pages, widget) {
+  try {
+    const pRef = widget.P?.();
+    if (pRef) {
+      for (const page of pages) {
+        if (page.ref === pRef) return page;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  try {
+    const pRef = widget.dict?.get?.(PDFName.of("P"));
+    if (pRef) {
+      for (const page of pages) {
+        if (page.ref === pRef) return page;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // Fallback: search page annots
+  try {
+    for (const page of pages) {
+      const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+      if (!annots) continue;
+
+      for (let i = 0; i < annots.size(); i++) {
+        const ref = annots.get(i);
+        if (ref === widget.ref) return page;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  return null;
+}
+
+function _drawWidgetBox(page, rect) {
+  try {
+    page.drawRectangle({
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      borderWidth: 0.6,
+      borderColor: rgb(0.65, 0.65, 0.65)
+    });
+  } catch {
+    /* best effort */
+  }
+}
+
+function _drawTextField(page, field, rect, font) {
+  let text = "";
+  try {
+    text = field.getText?.() ?? "";
+  } catch {
+    text = "";
+  }
+  text = String(text ?? "");
+
+  if (!text) return;
+
+  let multiline = false;
+  try {
+    multiline = field.isMultiline?.() ?? false;
+  } catch {
+    /* ignore */
+  }
+
+  let comb = false;
+  try {
+    comb = field.isCombed?.() ?? false;
+  } catch {
+    /* ignore */
+  }
+
+  if (comb) {
+    _drawCombText(page, text, rect, font);
+    return;
+  }
+
+  if (multiline || text.includes("\n")) {
+    _drawMultilineText(page, text, rect, font);
+    return;
+  }
+
+  const fontSize = _fitSingleLineFontSize(text, rect, font);
+  const baselineY = rect.y + Math.max(2, (rect.height - fontSize) / 2);
+
+  page.drawText(text, {
+    x: rect.x + 2,
+    y: baselineY,
+    size: fontSize,
+    font,
+    color: rgb(0, 0, 0),
+    maxWidth: Math.max(1, rect.width - 4)
+  });
+}
+
+function _drawMultilineText(page, text, rect, font) {
+  const lines = String(text).replace(/\r/g, "").split("\n");
+  const fontSize = Math.max(
+    8,
+    Math.min(11, rect.height / Math.max(lines.length + 0.5, 2))
+  );
+  const lineHeight = fontSize + 1.5;
+
+  let y = rect.y + rect.height - fontSize - 2;
+
+  for (const line of lines) {
+    if (y < rect.y + 1) break;
+
+    page.drawText(line, {
+      x: rect.x + 2,
+      y,
+      size: fontSize,
+      font,
+      color: rgb(0, 0, 0),
+      maxWidth: Math.max(1, rect.width - 4),
+      lineHeight
+    });
+
+    y -= lineHeight;
+  }
+}
+
+function _drawCombText(page, text, rect, font) {
+  const chars = String(text).split("");
+  const count = Math.max(chars.length, 1);
+  const cellWidth = rect.width / count;
+  const fontSize = Math.max(8, Math.min(12, rect.height - 4));
+
+  chars.forEach((ch, i) => {
+    const textWidth = font.widthOfTextAtSize(ch, fontSize);
+    const x = rect.x + i * cellWidth + (cellWidth - textWidth) / 2;
+    const y = rect.y + Math.max(2, (rect.height - fontSize) / 2);
+
+    page.drawText(ch, {
+      x,
+      y,
+      size: fontSize,
+      font,
+      color: rgb(0, 0, 0)
+    });
+
+    if (i < count - 1) {
+      try {
+        page.drawLine({
+          start: { x: rect.x + (i + 1) * cellWidth, y: rect.y },
+          end: {
+            x: rect.x + (i + 1) * cellWidth,
+            y: rect.y + rect.height
+          },
+          thickness: 0.4,
+          color: rgb(0.75, 0.75, 0.75)
+        });
+      } catch {
+        /* best effort */
+      }
+    }
+  });
+}
+
+function _fitSingleLineFontSize(text, rect, font) {
+  let size = Math.min(12, rect.height - 4);
+  size = Math.max(size, 6);
+
+  while (size > 6) {
+    const width = font.widthOfTextAtSize(text, size);
+    if (width <= rect.width - 4) return size;
+    size -= 0.5;
+  }
+
+  return 6;
+}
+
+function _drawCheckBox(page, field, rect, zapf) {
+  let checked = false;
+  try {
+    checked = field.isChecked();
+  } catch {
+    checked = false;
+  }
+
+  if (!checked) return;
+
+  const size = Math.max(8, Math.min(rect.width, rect.height) - 4);
+
+  page.drawText("\u2714", {
+    x: rect.x + Math.max(1, (rect.width - size * 0.7) / 2),
+    y: rect.y + Math.max(1, (rect.height - size) / 2),
+    size,
+    font: zapf,
+    color: rgb(0, 0, 0)
+  });
+}
+
+function _drawRadioGroup(page, field, widget, rect) {
+  let selected = null;
+  try {
+    selected = field.getSelected();
+  } catch {
+    selected = null;
+  }
+
+  if (!selected) return;
+
+  let widgetOnValue = null;
+  try {
+    widgetOnValue = widget.getOnValue?.();
+  } catch {
+    /* ignore */
+  }
+
+  if (!widgetOnValue) {
+    try {
+      const ap = widget.dict?.lookupMaybe?.(PDFName.of("AP"), PDFDict);
+      const n = ap?.lookupMaybe?.(PDFName.of("N"), PDFDict);
+      if (n) {
+        const keys = n.keys();
+        for (const k of keys) {
+          const name = k?.decodeText?.() ?? k?.encodedName ?? String(k);
+          if (name !== "/Off" && name !== "Off") {
+            widgetOnValue = name.replace(/^\//, "");
+            break;
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const selectedStr = String(selected).replace(/^\//, "");
+  const onStr = String(widgetOnValue ?? "").replace(/^\//, "");
+
+  if (!onStr || selectedStr !== onStr) return;
+
+  // Circle outline
+  try {
+    page.drawEllipse({
+      x: rect.x + rect.width / 2,
+      y: rect.y + rect.height / 2,
+      xScale: rect.width / 2 - 1,
+      yScale: rect.height / 2 - 1,
+      borderWidth: 0.8,
+      borderColor: rgb(0, 0, 0)
+    });
+  } catch {
+    /* best effort */
+  }
+
+  // Inner filled dot (drawn as a filled ellipse instead of a text glyph
+  // so we avoid WinAnsi encoding issues with bullet characters)
+  try {
+    const r = Math.min(rect.width, rect.height) / 4;
+    page.drawEllipse({
+      x: rect.x + rect.width / 2,
+      y: rect.y + rect.height / 2,
+      xScale: r,
+      yScale: r,
+      color: rgb(0, 0, 0)
+    });
+  } catch {
+    /* best effort */
+  }
+}
+
+function _drawDropdown(page, field, rect, font) {
+  let text = "";
+  try {
+    const selected = field.getSelected?.();
+    if (Array.isArray(selected)) {
+      text = selected.join(", ");
+    } else {
+      text = selected ?? "";
+    }
+  } catch {
+    text = "";
+  }
+
+  text = String(text ?? "");
+  if (!text) return;
+
+  const fontSize = _fitSingleLineFontSize(text, rect, font);
+
+  page.drawText(text, {
+    x: rect.x + 2,
+    y: rect.y + Math.max(2, (rect.height - fontSize) / 2),
+    size: fontSize,
+    font,
+    color: rgb(0, 0, 0),
+    maxWidth: Math.max(1, rect.width - 12)
+  });
+}
+
+function _drawOptionList(page, field, rect, font) {
+  let selected = [];
+  try {
+    selected = field.getSelected?.() || [];
+  } catch {
+    selected = [];
+  }
+
+  if (!Array.isArray(selected)) {
+    selected = [selected].filter(Boolean);
+  }
+
+  if (!selected.length) return;
+
+  const lines = selected.map((v) => String(v));
+  const fontSize = Math.max(
+    8,
+    Math.min(11, rect.height / Math.max(lines.length + 0.5, 2))
+  );
+  const lineHeight = fontSize + 1.5;
+
+  let y = rect.y + rect.height - fontSize - 2;
+
+  for (const line of lines) {
+    if (y < rect.y + 1) break;
+
+    page.drawText(line, {
+      x: rect.x + 2,
+      y,
+      size: fontSize,
+      font,
+      color: rgb(0, 0, 0),
+      maxWidth: Math.max(1, rect.width - 4)
+    });
+
+    y -= lineHeight;
+  }
+}
+
+/** Remove only Widget annotations; preserve links, stamps, comments, etc. */
+function _removeWidgetAnnotations(pdfDoc) {
+  for (const page of pdfDoc.getPages()) {
+    try {
+      const annotationsRef = page.node.get(PDFName.of("Annots"));
+      if (!annotationsRef) continue;
+
+      const annotations = pdfDoc.context.lookup(annotationsRef);
+      if (!annotations || !annotations.asArray) continue;
+
+      const filtered = annotations.asArray().filter((annotRef) => {
+        try {
+          const annot = pdfDoc.context.lookup(annotRef);
+          const subtype = annot?.get(PDFName.of("Subtype"));
+          return subtype?.toString() !== "/Widget";
+        } catch {
+          return true;
+        }
+      });
+
+      if (filtered.length === 0) {
+        page.node.delete(PDFName.of("Annots"));
+      } else {
+        page.node.set(PDFName.of("Annots"), pdfDoc.context.obj(filtered));
+      }
+    } catch {
+      /* best effort */
+    }
+  }
+
+  try {
+    pdfDoc.catalog.delete(PDFName.of("AcroForm"));
+  } catch {
+    /* best effort */
+  }
+}
 
 export const mailTemplate = (param) => {
   const appName = "LexySign";
@@ -3624,10 +4411,8 @@ export const updateDateWidgetsRes = (
         : [];
       const sortedPlaceHolder = placeHolder
         .sort((a, b) => a.pageNumber - b.pageNumber)
-        .map((ph) => ({
-          ...ph,
-          // Sort positions within each page
-          pos: [...ph.pos]
+        .map((ph) => {
+          const sortedWidgets = [...ph.pos]
             .sort((a, b) => {
               // Sort widgets by Y position (top to bottom) and X position (left to right)
               // Treat widgets within 5px Y difference as belonging to the same row
@@ -3659,9 +4444,14 @@ export const updateDateWidgetsRes = (
                 };
               }
               return widget;
-            })
-        }));
-      return { ...item, placeHolder: sortedPlaceHolder };
+            });
+          let widgetsWithResponses = sortedWidgets;
+          return { ...ph, pos: widgetsWithResponses };
+        });
+      return {
+        ...item,
+        placeHolder: applyDuplicateResponsesToPages(sortedPlaceHolder)
+      };
     }
 
     return item;
@@ -3759,8 +4549,11 @@ export const handleCheckResponse = (checkUser, setminRequiredCount) => {
       if (checkboxExist) {
         //get all required type checkbox
         requiredCheckbox = checkUser[0].placeHolder[i].pos.filter(
-          (position) =>
-            !position.options?.isReadOnly && position.type === "checkbox"
+          (position) => {
+            return (
+              !position.options?.isReadOnly && position.type === "checkbox"
+            );
+          }
         );
         //if required type checkbox data exit then check user checked all checkbox or some checkbox remain to check
         //also validate to minimum and maximum required checkbox
@@ -3812,10 +4605,13 @@ export const handleCheckResponse = (checkUser, setminRequiredCount) => {
       else {
         //get all required type widgets except checkbox and radio
         const requiredWidgets = checkUser[0].placeHolder[i].pos.filter(
-          (position) =>
-            position.type === "signature" ||
-            (position.options?.status === "required" &&
-              position.type !== "checkbox")
+          (position) => {
+            return (
+              position.type === "signature" ||
+              (position.options?.status === "required" &&
+                position.type !== "checkbox")
+            );
+          }
         );
         if (requiredWidgets && requiredWidgets?.length > 0) {
           let checkSigned;
@@ -3944,7 +4740,7 @@ export const sendEmailToSigners = async (
   let senderPhone = pdfDetails?.[0]?.ExtUserPtr?.Phone;
   let signerMail = signersdata.slice();
   if (pdfDetails?.[0]?.SendinOrder && pdfDetails?.[0]?.SendinOrder === true) {
-    signerMail.splice(1);
+    signerMail = signerMail[0] ? [signerMail[0]] : [];
   }
   for (let i = 0; i < signerMail.length; i++) {
     try {
@@ -4036,15 +4832,18 @@ export const sendEmailToSigners = async (
         localExpireDate: localExpireDate,
         signingUrl: signPdf
       };
+      // Pick a role-appropriate default template (viewers get a "view"
+      // template instead of the "sign" template).
+      const defaultTemplate = mailTemplate(mailparam);
       let params = {
         extUserId: owner?.objectId,
         recipient: signerMail[i].Email,
         subject: replaceVar?.subject
           ? replaceVar?.subject
-          : mailTemplate(mailparam).subject,
+          : defaultTemplate.subject,
         replyto: senderEmail,
         from: from,
-        html: replaceVar?.body ? replaceVar?.body : mailTemplate(mailparam).body
+        html: replaceVar?.body ? replaceVar?.body : defaultTemplate.body
       };
 
       sendMail = await axios.post(url, params, { headers: headers });

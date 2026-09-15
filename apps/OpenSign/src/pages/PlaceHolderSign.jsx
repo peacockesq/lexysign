@@ -67,11 +67,14 @@ import * as utils from "../utils";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  beginDraftPersistenceWrite,
   bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
+  commitDraftPersistenceWrite,
   editableSourceUrl,
   evaluateFinalizeGuard,
+  isDraftPersistenceWriteCurrent,
   shouldExposeSignerShareLinks
 } from "../utils/draftDocumentPreparation";
 import { resetWidgetState, setPrefillImg } from "../redux/reducers/widgetSlice";
@@ -1043,6 +1046,10 @@ function PlaceHolderSign() {
   }, [signerPos, signersdata, signatureType, pdfBase64Url]);
   // `autosavedetails` is used to save doc details after every 2 sec when changes are happern in placeholder like drag-drop widgets, remove signers
   const autosavedetails = async () => {
+    const draftWrite = beginDraftPersistenceWrite({
+      documentId,
+      kind: "autosave"
+    });
     const signers = signersdata?.reduce((acc, x) => {
       if (x.objectId) {
         acc.push({
@@ -1055,6 +1062,9 @@ function PlaceHolderSign() {
     }, []);
     let pdfUrl;
     if (isUploadPdf) {
+      if (!isDraftPersistenceWriteCurrent(draftWrite)) {
+        return;
+      }
       const pdfName = generatePdfName(16);
       pdfUrl = await convertBase64ToFile(
         pdfName,
@@ -1063,20 +1073,23 @@ function PlaceHolderSign() {
       );
     }
     try {
-      const docCls = new Parse.Object("contracts_Document");
-      docCls.id = documentId;
-      if (signerPos?.length > 0) {
-        docCls.set("Placeholders", signerPos);
-      }
-      docCls.set("Signers", signers);
-      docCls.set("SignatureType", signatureType);
-      if (pdfUrl) {
-        docCls.set("URL", pdfUrl);
-      }
-      const res = await docCls.save();
-      if (res && pdfUrl) {
-        pdfDetails[0] = { ...pdfDetails[0], URL: pdfUrl };
-      }
+      await commitDraftPersistenceWrite(draftWrite, async () => {
+        const docCls = new Parse.Object("contracts_Document");
+        docCls.id = documentId;
+        if (signerPos?.length > 0) {
+          docCls.set("Placeholders", signerPos);
+        }
+        docCls.set("Signers", signers);
+        docCls.set("SignatureType", signatureType);
+        if (pdfUrl) {
+          docCls.set("URL", pdfUrl);
+        }
+        const res = await docCls.save();
+        if (res && pdfUrl) {
+          pdfDetails[0] = { ...pdfDetails[0], URL: pdfUrl };
+        }
+        return res;
+      });
     } catch (e) {
       console.log("error", e);
       alert(t("something-went-wrong-mssg"));
@@ -1093,6 +1106,10 @@ function PlaceHolderSign() {
     if (pdfDetails?.[0]?.SendinOrder && pdfDetails?.[0]?.SendinOrder === true) {
       signerMail.splice(1);
     }
+    const draftWrite = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next"
+    });
     try {
       let cleanSourceUrl;
       if (isUploadPdf) {
@@ -1136,17 +1153,27 @@ function PlaceHolderSign() {
             signatureType: pdfDetails?.[0]?.SignatureType,
             url: cleanSourceUrl
           });
-          await axios.put(
-            `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
-            data,
-            {
-              headers: {
-                "Content-Type": "application/json",
-                "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
-                "X-Parse-Session-Token": localStorage.getItem("accesstoken")
-              }
+          const committed = await commitDraftPersistenceWrite(
+            draftWrite,
+            async () => {
+              await axios.put(
+                `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
+                data,
+                {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "X-Parse-Application-Id": localStorage.getItem("parseAppId"),
+                    "X-Parse-Session-Token": localStorage.getItem("accesstoken")
+                  }
+                }
+              );
+              return data;
             }
           );
+          if (!committed || committed.skipped) {
+            alert(t("something-went-wrong-mssg"));
+            return;
+          }
           setPdfDetails(applyDraftFieldsToPdfDetails(pdfDetails, data));
           setIsLoading({ isLoad: false });
           setIsSendAlert({ mssg: "confirm", alert: true });

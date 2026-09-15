@@ -6,10 +6,13 @@ import { openSignSrc, serverSrc } from "./paths.mjs";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  beginDraftPersistenceWrite,
   bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
+  commitDraftPersistenceWrite,
   evaluateFinalizeGuard,
+  isDraftPersistenceWriteCurrent,
   shouldExposeSignerShareLinks
 } from "../../../apps/OpenSign/src/utils/draftDocumentPreparation.js";
 
@@ -88,6 +91,9 @@ export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdf
       utils: { withSessionValidation: (fn) => fn },
       buildDraftSavePayload,
       applyDraftFieldsToPdfDetails,
+      beginDraftPersistenceWrite,
+      commitDraftPersistenceWrite,
+      isDraftPersistenceWriteCurrent,
       setIsUiLoading: (v) => {
         state.isUiLoading = v;
       },

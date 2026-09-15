@@ -267,6 +267,7 @@ describe("Next persists changed clean source without baking prefill", () => {
     const rejectedAuto = runSourceBlock(
       auto,
       {
+        ...prep,
         signersdata: [],
         signerPos: [],
         signatureType: [],

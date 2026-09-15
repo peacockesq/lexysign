@@ -3,16 +3,20 @@ import { describe, it } from "node:test";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  beginDraftPersistenceWrite,
   bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
+  commitDraftPersistenceWrite,
   editableSourceUrl,
   evaluateFinalizeGuard,
+  isDraftPersistenceWriteCurrent,
   isDraftSavePayload,
   isPersistedInvitationExpired,
   isSameDraftActivation,
   parsePersistedExpiryMs,
   preparedOutputUrl,
+  resetDraftPersistenceState,
   shouldExposeSignerShareLinks
 } from "../../apps/OpenSign/src/utils/draftDocumentPreparation.js";
 
@@ -248,5 +252,104 @@ describe("draft document preparation helper", () => {
     assert.throws(() => assertActiveSession({}), /invalid session token/);
     assert.throws(() => assertActiveSession({ tenantId: "t" }), /invalid session token/);
     assert.doesNotThrow(() => assertActiveSession({ tenantId: "t", sessionToken: "s" }));
+  });
+
+  it("strict expiry helper keeps native ISO/Date producers and fail-closes invalid shapes", () => {
+    const unexpired = { ExpiryDate: { iso: "2099-01-01T00:00:00.000Z", __type: "Date" } };
+    const elapsed = { ExpiryDate: { iso: "2000-01-01T00:00:00.000Z", __type: "Date" } };
+    const now = new Date("2026-09-15T12:00:00.000Z");
+    assert.equal(isPersistedInvitationExpired(unexpired, now), false);
+    assert.equal(isPersistedInvitationExpired(elapsed, now), true);
+    assert.equal(
+      Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso: new Date("2099-01-01T00:00:00.000Z") } })),
+      true
+    );
+    assert.equal(
+      Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso: "2099-01-01T00:00:00Z" } })),
+      true
+    );
+    assert.equal(
+      Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso: "2026-09-15T12:00:00.000+00:00" } })),
+      true
+    );
+    for (const iso of [
+      4070908800000,
+      ["2099-01-01T00:00:00.000Z"],
+      "2099-02-30T00:00:00.000Z",
+      true,
+      {},
+      [],
+      "not-a-date",
+      "   "
+    ]) {
+      assert.equal(Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso, __type: "Date" } })), false);
+      assert.equal(isPersistedInvitationExpired({ ExpiryDate: { iso, __type: "Date" } }, now), true);
+    }
+  });
+
+  it("same-tab draft writes serialize PUTs and never let an older autosave commit after Next", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-doc-a";
+    const order = [];
+    let releaseAutoPut;
+    const autoHeld = new Promise((resolve) => {
+      releaseAutoPut = resolve;
+    });
+    let autoPutStarted;
+    const autoEntered = new Promise((resolve) => {
+      autoPutStarted = resolve;
+    });
+    const auto = beginDraftPersistenceWrite({ documentId, kind: "autosave" });
+    const autoCommit = commitDraftPersistenceWrite(auto, async () => {
+      autoPutStarted();
+      await autoHeld;
+      order.push("auto-put");
+      return "auto";
+    });
+    await autoEntered;
+    const next = beginDraftPersistenceWrite({ documentId, kind: "next" });
+    assert.equal(isDraftPersistenceWriteCurrent(auto), false);
+    assert.equal(isDraftPersistenceWriteCurrent(next), true);
+    const nextCommit = commitDraftPersistenceWrite(next, async () => {
+      order.push("next-put");
+      return "next";
+    });
+    releaseAutoPut();
+    const autoResult = await autoCommit;
+    const nextResult = await nextCommit;
+    assert.equal(autoResult.skipped, false);
+    assert.equal(autoResult.value, "auto");
+    assert.equal(nextResult.skipped, false);
+    assert.equal(nextResult.value, "next");
+    assert.deepEqual(order, ["auto-put", "next-put"]);
+  });
+
+  it("held autosave upload never writes after a newer Next, and a failed write does not deadlock retry", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-doc-b";
+    const auto = beginDraftPersistenceWrite({ documentId, kind: "autosave" });
+    assert.equal(isDraftPersistenceWriteCurrent(auto), true);
+    const next = beginDraftPersistenceWrite({ documentId, kind: "next" });
+    assert.equal(isDraftPersistenceWriteCurrent(auto), false);
+    const autoResult = await commitDraftPersistenceWrite(auto, async () => {
+      throw new Error("stale autosave must not write");
+    });
+    assert.equal(autoResult.skipped, true);
+    const nextResult = await commitDraftPersistenceWrite(next, async () => "next");
+    assert.equal(nextResult.skipped, false);
+    const failed = beginDraftPersistenceWrite({ documentId, kind: "next" });
+    await assert.rejects(
+      commitDraftPersistenceWrite(failed, async () => {
+        throw new Error("synthetic put failure");
+      }),
+      /synthetic put failure/
+    );
+    const retry = beginDraftPersistenceWrite({ documentId, kind: "next" });
+    const recovered = await commitDraftPersistenceWrite(retry, async () => "retry");
+    assert.equal(recovered.skipped, false);
+    assert.equal(recovered.value, "retry");
+    const other = beginDraftPersistenceWrite({ documentId: "persist-doc-c", kind: "autosave" });
+    assert.equal(isDraftPersistenceWriteCurrent(other), true);
+    assert.equal(isDraftPersistenceWriteCurrent(retry), true);
   });
 });

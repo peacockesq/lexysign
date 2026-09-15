@@ -124,7 +124,7 @@ export default async function docxtopdf(req, res) {
   }
 
   try {
-    const uploadedSizeBytes = req.file.size || req.file.buffer.length;
+    const uploadedSizeBytes = req.file.size ?? req.file.buffer.length;
 
     // ---- Auth: current user ----
     const userRes = await axios.get(`${serverUrl}/users/me`, { headers: sessionHeader });

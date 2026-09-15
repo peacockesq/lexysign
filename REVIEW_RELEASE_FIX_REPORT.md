@@ -1,56 +1,76 @@
-# LexySign review-release F3/F4/F5
+# LexySign review-release F3 correction
 
 Worktree: `/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/review-release`
 Branch: `fix/lexysign-review-release`
-Base: `80ba54c6ba747789081c767f0798dca18d62c3a7`
-Independent BLOCK (immutable): `/home/trixie/lexysign-independent-80ba54-d2okJJ/REVIEW.md`
-No SSH, push, live Docker, mail, client data, or config changes. Local fake-transport tests only.
+Parent (immutable prior candidate): `1a2cdbac798fc53f067182721b9aef1c86438b4d`
+Original BLOCK (immutable): `/home/trixie/lexysign-independent-80ba54-d2okJJ/REVIEW.md`
+Re-review BLOCK (immutable): `/home/trixie/lexysign-release-rereview-1a2cdb-ns8eplb7/REVIEW.md`
+No SSH, push, live Docker, mail, client data, or config/provider changes. Local fake-transport tests only.
+F4/F5 helper fixes in `1a2cdb` are unchanged. F1/F2 are product-UI; another worker owns those.
 
-F1/F2 are product-UI; another worker owns those.
+This commit does not clear the independent re-review BLOCK. Parent integrates only after a fresh independent frozen review of this SHA.
 
-## What changed
+## F3 — env occurrence scan (root cause)
 
-### F3 — Mailpit sink fail-closed
+`1a2cdb` still BLOCKED: `_env_lookup_ci` returned the first case-insensitive match after `env_map` collapsed `Config.Env` into a dict. An empty lowercase key hid an active uppercase Mailpit setting. Exact duplicate keys last-won, so an active value followed by an empty same key was accepted.
 
-`validate_sink_container` now inspects `Config.Env`, `Config.Entrypoint`, `Config.Cmd`, and `Mounts`. Official activation names were taken from:
+`mailpit_outbound_reason` now walks every raw `Config.Env` occurrence. No dictionary collapse. Every case-insensitive match of a supported key is inspected; any active occurrence rejects. Linux uppercase/lowercase keys are distinct; the validator still conservatively rejects either. An empty/inert variant never shadows an active one in any order.
 
-- https://mailpit.axllent.org/docs/configuration/smtp-relay/
-- https://mailpit.axllent.org/docs/configuration/smtp-forward/
-- https://mailpit.axllent.org/docs/configuration/runtime-options/
+Covered: host, forward host/to, config, relay matching, relay-all — case collisions and exact duplicate-key values/orders. Inert `MP_SMTP_RELAY_ALL=false` still accepted. Error text names keys only; values are not copied into `ReleaseError`.
 
-Rejected: relay/forward config-file env and CLI (`MP_SMTP_RELAY_CONFIG`, `MP_SMTP_FORWARD_CONFIG`, `--smtp-relay-config`, `--smtp-forward-config`), host/to (`MP_SMTP_RELAY_HOST`, `MP_SMTP_FORWARD_HOST`, `MP_SMTP_FORWARD_TO`, docs-prose `MP_FORWARD_TO`), matching (`MP_SMTP_RELAY_MATCHING` / `--smtp-relay-matching`), and true relay-all (`MP_SMTP_RELAY_ALL` / `--smtp-relay-all`). Split, equals, case, and boolean forms are handled. Existing five-key reject is kept.
+## CLI / mounts
 
-Not rejected without reason: `MP_SMTP_RELAY_ALL=false` / `--smtp-relay-all=false`, tmpfs `/tmp` database, loopback UI `--listen 127.0.0.1:8025`. Optional companion relay fields without host/config/to are not treated as activation. Image pin and “no actual outbound” remain separate gates. Tests never enable real outbound.
+pflag `BoolVar` gives bare `--smtp-relay-all` `NoOptDefVal=true` and does not consume the next token. `--smtp-relay-all=false` remains the inert equals form. Split `--smtp-relay-all false` is conservative activation (reject). Upstream Cobra rejects positional `false` before server start, so split-false is not an independent runnable outbound witness.
 
-### F4 — files tar.gz CRC/footer
+The mounts loop was a no-op. It is removed. Mount contents are not opened or validated; this is not a broad egress redesign.
 
-Files archives now drain gzip to EOF in `GZIP_CHUNK` reads before tar structure checks. CRC/truncation is no longer inferred from tar member headers alone. SHA/size/source/age/target gates are unchanged. Native mongo magic `6de29981` and invented-`mdmp` reject are unchanged. Absolute/`..` tar members are rejected. Full-manifest negative with an honestly recomputed digest of a CRC-flipped fixture now fails. No whole-archive `read_bytes` / `gzip.decompress` in the verifiers.
+## Tests (TDD)
 
-### F5 — health recheck both apps
-
-`verify_running_images` always inspects client and server in the same observation pass. A previously healthy peer is not dropped from later polls. Current running state, health, exact image, and revision labels are enforced every pass. Deadline/poll env semantics are preserved. No Caddy/Mongo restart or broad compose. Synthetic polling still does not prove permanent health after return.
-
-## Tests
-
-Command:
+RED, tests only, helper still `1a2cdb` behavior:
 
 ```
 PYTHONDONTWRITEBYTECODE=1 bash deploy/lexysign/tests/run-tests.sh
 ```
 
-Actual result: **89 passed, 0 failed**, exit 0.
+Actual: **96 tests: 89 passed, 7 failed**, exit 1. Log: `/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/f3-correction-controls/red-supplied-tests.log`
 
-- Original 71 names all still present and passing (none skipped).
-- 18 added controls from the independent reviewer probes (outside frozen evidence): four F3 bypasses, neighboring official spellings, inert Mailpit baseline, files CRC/truncation/good/malicious-path, files gzip streaming source check, health dead/unhealthy/image-drift while peer starts, same-pass healthy baseline.
+Failed (ReleaseError was not raised):
 
-New sink/backup/health tests patch `inspect_container` or call validators directly. They do not invoke release `main` against native Docker. Existing harness tests still use the fake `docker`/`curl` transport.
+- `sink_rejects_split_smtp_relay_all_false_conservative_pflag`
+- `sink_rejects_case_masked_relay_host_any_order`
+- `sink_rejects_case_masked_forward_host_to_any_order`
+- `sink_rejects_case_masked_relay_and_forward_config_any_order`
+- `sink_rejects_case_masked_relay_matching_and_all_any_order`
+- `sink_rejects_duplicate_env_keys_any_active_occurrence` (active then empty same key)
+- `sink_rejects_env_activation_without_leaking_values`
+
+Original 89 names still passed on that run, including inert `MP_SMTP_RELAY_ALL=false` / `--smtp-relay-all=false`.
+
+GREEN after the helper change, same command: **96 passed, 0 failed**, exit 0. Log: `.../f3-correction-controls/green-supplied-tests.log`
+
+## Independent controls (outside original evidence)
+
+Copied/adapted `/home/trixie/lexysign-release-rereview-1a2cdb-ns8eplb7/regression-controls.py` to `/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/f3-correction-controls/regression-controls.py`. Candidate path is this worktree helper. Original helper is a byte-identical copy (`sha256 3a398597a69170bef8159ffdc7945e6e6827879567c184951d0be758445117eb`). Original review tree was not written.
+
+```
+python3 -B .../f3-correction-controls/regression-controls.py
+```
+
+Actual run `controls-nwb1k3uc`, **exit 0**:
+
+- F3 **21/21 PASS**
+- F4 **8/8 PASS** (preserved)
+- F5 **8/8 PASS** (preserved)
+
+Candidate helper sha256 in that result: `cf946b60433b1ed8cd876597581736026c859d20940f413abb1fca5628996d10`. Offline declarations and synthetic inspect/format fixtures only; no native mail/Docker/Mongo.
 
 ## Unresolved native gates
 
-- Independent BLOCK at `80ba54c6ba747789081c767f0798dca18d62c3a7` is not cleared until F1–F5 are rerun against a newly frozen commit. This lane only addresses F3–F5.
+- Independent BLOCKs at `80ba54c6ba747789081c767f0798dca18d62c3a7` and `1a2cdbac798fc53f067182721b9aef1c86438b4d` stay on those SHAs. This lane needs a new frozen review.
 - No live Mailpit, no real SMTP forward/relay experiment, no native mongodump restore, no production/staging Docker, no hosted CI.
+- Split-false conservative deny is not proof of a running native sink.
+- Mount files are not opened; image pin and “container currently has no outbound path” remain separate proofs.
 - Health waiter success is one observation pass, not permanent health.
-- Image digest pin and “container currently has no outbound path” are still separate proofs.
 - Archive CRC/tar checks are not restore proof.
 
 A corrected helper still does not authorize deployment.

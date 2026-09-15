@@ -300,12 +300,19 @@ def _mailpit_enabled(raw: str) -> bool:
     return bool(text)
 
 
-def _env_lookup_ci(env_values: Mapping[str, str], key: str) -> tuple[str, str] | None:
-    wanted = key.casefold()
-    for raw_key, raw_val in env_values.items():
-        if str(raw_key).casefold() == wanted:
-            return str(raw_key), "" if raw_val is None else str(raw_val)
-    return None
+def _env_occurrences(raw: Any) -> list[tuple[str, str]]:
+    """Preserve every Config.Env KEY=VALUE occurrence. Do not collapse duplicates."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [(str(k), "" if v is None else str(v)) for k, v in raw.items()]
+    out: list[tuple[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and "=" in item:
+                key, value = item.split("=", 1)
+                out.append((key, value))
+    return out
 
 
 def _argv_from_inspect(raw: Any) -> list[str]:
@@ -360,18 +367,15 @@ def _mailpit_cli_activation(argv: Sequence[str]) -> str | None:
             return f"CLI {original_name} is present"
         if name in MAILPIT_RELAY_ALL_FLAGS:
             if eq:
+                # Explicit --smtp-relay-all=false is the pflag disabled form.
                 enabled = _mailpit_enabled(value)
                 i += 1
-            elif i + 1 < n:
-                nxt = str(argv[i + 1])
-                nxt_fold = nxt.strip().casefold()
-                if nxt_fold in MAILPIT_TRUTHY or nxt_fold in MAILPIT_FALSY:
-                    enabled = _mailpit_enabled(nxt)
-                    i += 2
-                else:
-                    enabled = True
-                    i += 1
             else:
+                # pflag BoolVar NoOptDefVal=true: a bare flag does not consume
+                # the next token. `--smtp-relay-all false` is therefore
+                # activation. Cobra rejects positional `false` before server
+                # start, so this conservative deny is not a runnable outbound
+                # witness.
                 enabled = True
                 i += 1
             if enabled:
@@ -383,7 +387,11 @@ def _mailpit_cli_activation(argv: Sequence[str]) -> str | None:
 
 def mailpit_outbound_reason(doc: Mapping[str, Any]) -> str | None:
     config = doc.get("Config") or {}
-    env_values = env_map(config.get("Env"))
+    # Inspect every raw occurrence. A dict collapse would drop duplicate keys,
+    # and a first-match CI lookup would let an empty/inert case variant hide
+    # an active supported key. Any active occurrence rejects. Reasons name
+    # keys only; values are never copied into errors.
+    occurrences = _env_occurrences(config.get("Env"))
     activation_env = (
         RELAY_ENV_KEYS
         + MAILPIT_CONFIG_ENV
@@ -397,23 +405,23 @@ def mailpit_outbound_reason(doc: Mapping[str, Any]) -> str | None:
         if folded in seen:
             continue
         seen.add(folded)
-        found = _env_lookup_ci(env_values, key)
-        if found and found[1].strip():
-            return f"environment {found[0]} activates Mailpit forward/relay"
-    found_all = _env_lookup_ci(env_values, MAILPIT_RELAY_ALL_ENV)
-    if found_all and _mailpit_enabled(found_all[1]):
-        return f"environment {found_all[0]} activates Mailpit relay-all"
+        for raw_key, raw_val in occurrences:
+            if str(raw_key).casefold() != folded:
+                continue
+            if str(raw_val).strip():
+                return f"environment {raw_key} activates Mailpit forward/relay"
+    relay_all = MAILPIT_RELAY_ALL_ENV.casefold()
+    for raw_key, raw_val in occurrences:
+        if str(raw_key).casefold() != relay_all:
+            continue
+        if _mailpit_enabled("" if raw_val is None else str(raw_val)):
+            return f"environment {raw_key} activates Mailpit relay-all"
     argv = _argv_from_inspect(config.get("Entrypoint")) + _argv_from_inspect(config.get("Cmd"))
     cli = _mailpit_cli_activation(argv)
     if cli:
         return cli
-    mounts = doc.get("Mounts") or []
-    if isinstance(mounts, list):
-        for mount in mounts:
-            if not isinstance(mount, Mapping):
-                continue
-            # tmpfs /tmp (Mailpit database) and ordinary binds are not outbound.
-            _ = mount.get("Type") or mount.get("Destination")
+    # Mounts are not opened or content-validated. tmpfs /tmp and bind/config
+    # files are not an outbound proof; env and CLI activation names are.
     return None
 
 

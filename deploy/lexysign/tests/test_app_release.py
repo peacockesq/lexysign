@@ -669,6 +669,14 @@ def expect_sink_rejected(doc, substr: str = "relay") -> None:
     expect_raises(lambda: call_validate_sink(doc), app.ReleaseError, substr)
 
 
+def sink_reject_text(doc) -> str:
+    try:
+        call_validate_sink(doc)
+    except app.ReleaseError as exc:
+        return str(exc)
+    raise AssertionError("ReleaseError was not raised")
+
+
 def _staging_backup_with_files(
     root: Path, *, raw_tgz: bytes | None = None, tar_name: str | None = None
 ) -> Path:
@@ -1747,7 +1755,163 @@ def _():
     call_validate_sink(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=FALSE"]))
     call_validate_sink(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=0"]))
     call_validate_sink(inert_sink_doc(cmd=["--listen", "127.0.0.1:8025", "--smtp-relay-all=false"]))
-    call_validate_sink(inert_sink_doc(cmd=["--smtp-relay-all", "false"]))
+
+
+@test("sink_rejects_split_smtp_relay_all_false_conservative_pflag")
+def _():
+    # pflag BoolVar: bare --smtp-relay-all does not consume a following token.
+    # Conservative reject. Upstream Cobra rejects positional `false` before
+    # server start, so this is not an independent runnable outbound witness.
+    expect_sink_rejected(inert_sink_doc(cmd=["--smtp-relay-all", "false"]))
+    expect_sink_rejected(
+        inert_sink_doc(
+            env=["MP_SMTP_RELAY_HOST=smtp.example.test"],
+            cmd=["--smtp-relay-all", "false"],
+        )
+    )
+
+
+@test("sink_rejects_case_masked_relay_host_any_order")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(env=["mp_smtp_relay_host=", "MP_SMTP_RELAY_HOST=smtp.example.test"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_HOST=smtp.example.test", "mp_smtp_relay_host="])
+    )
+
+
+@test("sink_rejects_case_masked_forward_host_to_any_order")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(
+            env=[
+                "mp_smtp_forward_host=",
+                "MP_SMTP_FORWARD_HOST=smtp.example.test",
+                "mp_smtp_forward_to=",
+                "MP_SMTP_FORWARD_TO=review@example.test",
+            ]
+        )
+    )
+    expect_sink_rejected(
+        inert_sink_doc(
+            env=[
+                "MP_SMTP_FORWARD_HOST=smtp.example.test",
+                "mp_smtp_forward_host=",
+                "MP_SMTP_FORWARD_TO=review@example.test",
+                "mp_smtp_forward_to=",
+            ]
+        )
+    )
+
+
+@test("sink_rejects_case_masked_relay_and_forward_config_any_order")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(env=["mp_smtp_relay_config=", "MP_SMTP_RELAY_CONFIG=/config/relay.yml"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_CONFIG=/config/relay.yml", "mp_smtp_relay_config="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["mp_smtp_forward_config=", "MP_SMTP_FORWARD_CONFIG=/config/forward.yml"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_CONFIG=/config/forward.yml", "mp_smtp_forward_config="])
+    )
+
+
+@test("sink_rejects_case_masked_relay_matching_and_all_any_order")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(env=["mp_smtp_relay_matching=", "MP_SMTP_RELAY_MATCHING=@example.com$"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_MATCHING=@example.com$", "mp_smtp_relay_matching="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(
+            env=[
+                "mp_smtp_relay_host=",
+                "MP_SMTP_RELAY_HOST=smtp.example.test",
+                "mp_smtp_relay_all=false",
+                "MP_SMTP_RELAY_ALL=true",
+            ]
+        )
+    )
+    expect_sink_rejected(inert_sink_doc(env=["mp_smtp_relay_all=false", "MP_SMTP_RELAY_ALL=true"]))
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=true", "mp_smtp_relay_all=false"]))
+
+
+@test("sink_rejects_duplicate_env_keys_any_active_occurrence")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_HOST=", "MP_SMTP_RELAY_HOST=smtp.example.test"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_HOST=smtp.example.test", "MP_SMTP_RELAY_HOST="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_HOST=", "MP_SMTP_FORWARD_HOST=smtp.example.test"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_HOST=smtp.example.test", "MP_SMTP_FORWARD_HOST="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_TO=", "MP_SMTP_FORWARD_TO=review@example.test"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_TO=review@example.test", "MP_SMTP_FORWARD_TO="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_CONFIG=", "MP_SMTP_RELAY_CONFIG=/config/relay.yml"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_CONFIG=/config/relay.yml", "MP_SMTP_RELAY_CONFIG="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_CONFIG=", "MP_SMTP_FORWARD_CONFIG=/config/forward.yml"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_FORWARD_CONFIG=/config/forward.yml", "MP_SMTP_FORWARD_CONFIG="])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_MATCHING=", "MP_SMTP_RELAY_MATCHING=@example.com$"])
+    )
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_MATCHING=@example.com$", "MP_SMTP_RELAY_MATCHING="])
+    )
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=false", "MP_SMTP_RELAY_ALL=true"]))
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=true", "MP_SMTP_RELAY_ALL=false"]))
+
+
+@test("sink_rejects_env_activation_without_leaking_values")
+def _():
+    secret_host = SECRET_VALUE + ".example.test"
+    secret_to = "leak+" + SECRET_VALUE + "@example.test"
+    secret_path = "/config/" + SECRET_VALUE + ".yml"
+    docs = [
+        inert_sink_doc(env=["mp_smtp_relay_host=", f"MP_SMTP_RELAY_HOST={secret_host}"]),
+        inert_sink_doc(
+            env=[
+                "mp_smtp_forward_host=",
+                f"MP_SMTP_FORWARD_HOST={secret_host}",
+                "mp_smtp_forward_to=",
+                f"MP_SMTP_FORWARD_TO={secret_to}",
+            ]
+        ),
+        inert_sink_doc(env=["mp_smtp_relay_config=", f"MP_SMTP_RELAY_CONFIG={secret_path}"]),
+        inert_sink_doc(env=["mp_smtp_forward_config=", f"MP_SMTP_FORWARD_CONFIG={secret_path}"]),
+        inert_sink_doc(env=[f"MP_SMTP_RELAY_HOST={secret_host}", "MP_SMTP_RELAY_HOST="]),
+        inert_sink_doc(env=["MP_SMTP_RELAY_ALL=false", "MP_SMTP_RELAY_ALL=true"]),
+    ]
+    for doc in docs:
+        text = sink_reject_text(doc)
+        assert SECRET_VALUE not in text
+        assert secret_host not in text
+        assert secret_to not in text
+        assert secret_path not in text
+        assert "activates Mailpit" in text
 
 
 @test("backup_files_gzip_bad_crc_honest_manifest_fails")

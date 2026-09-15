@@ -9,7 +9,9 @@ import {
   editableSourceUrl,
   evaluateFinalizeGuard,
   isDraftSavePayload,
+  isPersistedInvitationExpired,
   isSameDraftActivation,
+  parsePersistedExpiryMs,
   preparedOutputUrl,
   shouldExposeSignerShareLinks
 } from "../../apps/OpenSign/src/utils/draftDocumentPreparation.js";
@@ -27,6 +29,23 @@ describe("draft document preparation helper", () => {
     assert.equal(payload.PreparedUrl, "https://files.example.test/prepared.pdf");
     assert.equal(isDraftSavePayload(payload), true);
     assert.equal(Object.prototype.hasOwnProperty.call(payload, "URL"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, "SignedUrl"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, "SentToOthers"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, "ExpiryDate"), false);
+  });
+
+  it("draft payload may persist a changed clean URL without dispatch fields", () => {
+    const payload = buildDraftSavePayload({
+      name: "Deed",
+      placeholders: [{ Id: "ph" }],
+      signers: [{ objectId: "c1" }],
+      signatureType: ["draw"],
+      preparedUrl: "https://files.example.test/prepared.pdf",
+      url: "https://files.example.test/clean-rotated.pdf"
+    });
+    assert.equal(payload.URL, "https://files.example.test/clean-rotated.pdf");
+    assert.equal(payload.PreparedUrl, "https://files.example.test/prepared.pdf");
+    assert.equal(isDraftSavePayload(payload), true);
     assert.equal(Object.prototype.hasOwnProperty.call(payload, "SignedUrl"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(payload, "SentToOthers"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(payload, "ExpiryDate"), false);
@@ -76,7 +95,8 @@ describe("draft document preparation helper", () => {
       objectId: "doc1",
       URL: "https://files.example.test/original.pdf",
       PreparedUrl: "https://files.example.test/prepared.pdf",
-      SignedUrl: "https://files.example.test/prepared.pdf"
+      SignedUrl: "https://files.example.test/prepared.pdf",
+      ExpiryDate: { iso: "2099-01-01T00:00:00.000Z", __type: "Date" }
     };
     const receipt = bindDraftActivationReceipt({
       documentId: "doc1",
@@ -109,6 +129,65 @@ describe("draft document preparation helper", () => {
     assert.equal(
       evaluateFinalizeGuard({ ...persisted, IsDeclined: true }, receipt).code,
       "declined"
+    );
+  });
+
+  it("receipt reuse enforces persisted ExpiryDate.iso and fail-closes malformed dates", () => {
+    const persisted = {
+      objectId: "doc1",
+      URL: "https://files.example.test/original.pdf",
+      PreparedUrl: "https://files.example.test/prepared.pdf",
+      SignedUrl: "https://files.example.test/prepared.pdf",
+      ExpiryDate: { iso: "2099-01-01T00:00:00.000Z", __type: "Date" }
+    };
+    const receipt = bindDraftActivationReceipt({
+      documentId: "doc1",
+      signedUrl: persisted.SignedUrl
+    });
+    assert.equal(evaluateFinalizeGuard(persisted, receipt).alreadyActivated, true);
+    assert.equal(isPersistedInvitationExpired(persisted, new Date("2026-09-15T12:00:00.000Z")), false);
+
+    const expired = {
+      ...persisted,
+      ExpiryDate: { iso: "2000-01-01T00:00:00.000Z", __type: "Date" }
+    };
+    const expiredGuard = evaluateFinalizeGuard(expired, receipt);
+    assert.equal(expiredGuard.ok, false);
+    assert.equal(expiredGuard.code, "expired");
+    assert.equal(isPersistedInvitationExpired(expired, new Date("2026-09-15T12:00:00.000Z")), true);
+
+    const dateObjectExpiry = {
+      ...persisted,
+      ExpiryDate: { iso: new Date("2000-01-01T00:00:00.000Z"), __type: "Date" }
+    };
+    assert.equal(evaluateFinalizeGuard(dateObjectExpiry, receipt).code, "expired");
+
+    const now = new Date("2026-09-15T12:00:00.000Z");
+    const equalExpiry = {
+      ...persisted,
+      ExpiryDate: { iso: "2026-09-15T12:00:00.000Z", __type: "Date" }
+    };
+    assert.equal(isPersistedInvitationExpired(equalExpiry, now), false);
+
+    for (const bad of [
+      { ...persisted, ExpiryDate: { iso: "not-a-date", __type: "Date" } },
+      { ...persisted, ExpiryDate: { iso: "", __type: "Date" } },
+      { ...persisted, ExpiryDate: { __type: "Date" } },
+      { ...persisted, ExpiryDate: null },
+      { ...persisted, ExpiryDate: undefined }
+    ]) {
+      assert.equal(Number.isFinite(parsePersistedExpiryMs(bad)), false);
+      assert.equal(evaluateFinalizeGuard(bad, receipt).ok, false);
+      assert.equal(evaluateFinalizeGuard(bad, receipt).alreadyActivated, undefined);
+      assert.notEqual(evaluateFinalizeGuard(bad, receipt).code, undefined);
+    }
+
+    assert.equal(
+      evaluateFinalizeGuard(
+        { ...expired, objectId: "other" },
+        receipt
+      ).code,
+      "already-dispatched"
     );
   });
 
@@ -147,6 +226,22 @@ describe("draft document preparation helper", () => {
     assert.equal(next[0].URL, "https://files.example.test/original.pdf");
     assert.equal(next[0].PreparedUrl, "https://files.example.test/prepared.pdf");
     assert.equal(next[0].Placeholders[0].Id, "ph");
+  });
+
+  it("in-memory pdfDetails pick up a changed clean URL without replacing it with PreparedUrl", () => {
+    const next = applyDraftFieldsToPdfDetails(
+      [{ Name: "old", URL: "https://files.example.test/original.pdf", Placeholders: [] }],
+      buildDraftSavePayload({
+        name: "new-title",
+        placeholders: [{ Id: "ph" }],
+        signers: [],
+        signatureType: [],
+        preparedUrl: "https://files.example.test/prepared.pdf",
+        url: "https://files.example.test/clean-rotated.pdf"
+      })
+    );
+    assert.equal(next[0].URL, "https://files.example.test/clean-rotated.pdf");
+    assert.equal(next[0].PreparedUrl, "https://files.example.test/prepared.pdf");
   });
 
   it("session guard fails closed without tenant or token", () => {

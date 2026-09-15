@@ -65,7 +65,7 @@ function createLocalStorage() {
   return localStorage;
 }
 
-export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdfDetails, signersdata, axiosPut }) {
+export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdfDetails, signersdata, axiosPut, isUploadPdf = false, pdfBase64Url = "", convertBase64ToFile, generatePdfName }) {
   const block = sliceBetween(
     placeholderSrc,
     "const saveDocumentDetails = utils.withSessionValidation(async () => {",
@@ -93,6 +93,14 @@ export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdf
       },
       signersdata,
       pdfDetails,
+      isUploadPdf,
+      pdfBase64Url,
+      generatePdfName: generatePdfName || (() => "synthetic-clean"),
+      convertBase64ToFile:
+        convertBase64ToFile ||
+        (async () => {
+          throw new Error("convertBase64ToFile is only used when isUploadPdf is true");
+        }),
       embedPrefilllWidgets: async () => pdfUrl,
       currentId: signersdata[0].Email,
       setCurrentId: (v) => {

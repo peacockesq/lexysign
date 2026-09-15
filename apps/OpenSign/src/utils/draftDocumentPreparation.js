@@ -1,14 +1,18 @@
 // Draft preparation is not invitation dispatch.
 // Next/autosave persist geometry, title, signers, and (when preparing) PreparedUrl.
 // URL remains the clean editable source PDF. PreparedUrl is the prefill-embedded
-// output used only at activation. SignedUrl / SentToOthers / ExpiryDate are
-// written once on explicit Send, Share, or owner-first self-sign.
+// output used only at activation. When the editor PDF changed (isUploadPdf), Next
+// also persists URL in the same success path so close/reopen does not depend on
+// the 2s autosave timer. SignedUrl / SentToOthers / ExpiryDate are written once
+// on explicit Send, Share, or owner-first self-sign.
 //
 // Same-page-session activation receipt:
 //   After this tab successfully writes SignedUrl, bindDraftActivationReceipt
 //   records {documentId, signedUrl}. A later Send/Share/self-sign in THIS tab
 //   with that matching receipt skips a second activation PUT so Share-then-Send
 //   and failed-before-mail retry can proceed. Receipt is in-memory only.
+//   Receipt reuse still enforces persisted ExpiryDate (Parse Date { iso })
+//   before alreadyActivated. Missing or unparseable iso does not authorize send.
 //
 // What is idempotent here:
 //   - First explicit Send/Share/self-sign in a tab activates once (one SignedUrl PUT).
@@ -61,7 +65,8 @@ export function buildDraftSavePayload({
   placeholders,
   signers,
   signatureType,
-  preparedUrl
+  preparedUrl,
+  url
 }) {
   const payload = {
     Name: name,
@@ -72,6 +77,9 @@ export function buildDraftSavePayload({
   if (preparedUrl) {
     payload.PreparedUrl = preparedUrl;
   }
+  if (url) {
+    payload.URL = url;
+  }
   return payload;
 }
 
@@ -81,9 +89,24 @@ export function isDraftSavePayload(payload) {
     !Object.prototype.hasOwnProperty.call(payload, "SignedUrl") &&
     !Object.prototype.hasOwnProperty.call(payload, "SentToOthers") &&
     !Object.prototype.hasOwnProperty.call(payload, "ExpiryDate") &&
-    !Object.prototype.hasOwnProperty.call(payload, "DocSentAt") &&
-    !Object.prototype.hasOwnProperty.call(payload, "URL")
+    !Object.prototype.hasOwnProperty.call(payload, "DocSentAt")
   );
+}
+
+// Parse Date contract used by reopen (PlaceHolderSign) and finalize:
+// contracts_Document.ExpiryDate.iso, compared with new Date(iso).getTime().
+export function parsePersistedExpiryMs(persisted) {
+  const iso = persisted?.ExpiryDate?.iso;
+  if (iso == null || iso === "") return Number.NaN;
+  return new Date(iso).getTime();
+}
+
+export function isPersistedInvitationExpired(persisted, now = new Date()) {
+  const expiryMs = parsePersistedExpiryMs(persisted);
+  if (!Number.isFinite(expiryMs)) return true;
+  const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  if (!Number.isFinite(nowMs)) return true;
+  return nowMs > expiryMs;
 }
 
 export function buildFinalizePayload({
@@ -126,6 +149,13 @@ export function evaluateFinalizeGuard(persisted, receipt) {
   // unless this same tab just activated this same draft (receipt match).
   if (persisted.SignedUrl) {
     if (isSameDraftActivation(persisted, receipt)) {
+      if (isPersistedInvitationExpired(persisted)) {
+        return {
+          ok: false,
+          code: "expired",
+          message: "Expired documents cannot be sent again."
+        };
+      }
       return {
         ok: true,
         alreadyActivated: true,
@@ -162,6 +192,9 @@ export function applyDraftFieldsToPdfDetails(pdfDetails, draftPayload) {
   };
   if (Object.prototype.hasOwnProperty.call(draftPayload, "PreparedUrl")) {
     next[0].PreparedUrl = draftPayload.PreparedUrl;
+  }
+  if (Object.prototype.hasOwnProperty.call(draftPayload, "URL")) {
+    next[0].URL = draftPayload.URL;
   }
   return next;
 }

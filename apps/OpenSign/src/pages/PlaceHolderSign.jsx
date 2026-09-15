@@ -1082,9 +1082,10 @@ function PlaceHolderSign() {
       alert(t("something-went-wrong-mssg"));
     }
   };
-  // Next persists a recoverable draft: geometry, title, signers, and PreparedUrl.
-  // URL (clean source) is not replaced. Dispatch flags are written only by
-  // finalizeInvitation on explicit Send / Share / owner-first self-sign.
+  // Next persists a recoverable draft: geometry, title, signers, PreparedUrl,
+  // and the current clean source URL when the editor PDF changed (isUploadPdf).
+  // Prefill-baked bytes stay on PreparedUrl only. Dispatch flags are written
+  // only by finalizeInvitation on explicit Send / Share / owner-first self-sign.
   const saveDocumentDetails = utils.withSessionValidation(async () => {
     setIsUiLoading(true);
     let signerMail = signersdata.slice();
@@ -1093,6 +1094,25 @@ function PlaceHolderSign() {
       signerMail.splice(1);
     }
     try {
+      let cleanSourceUrl;
+      if (isUploadPdf) {
+        try {
+          const cleanPdfName = generatePdfName(16);
+          cleanSourceUrl = await convertBase64ToFile(
+            cleanPdfName,
+            pdfBase64Url,
+            "",
+          );
+        } catch (e) {
+          console.log("error", e);
+          alert(t("something-went-wrong-mssg"));
+          return;
+        }
+        if (!cleanSourceUrl) {
+          alert(t("something-went-wrong-mssg"));
+          return;
+        }
+      }
       const pdfUrl = await embedPrefilllWidgets();
       if (pdfUrl) {
         const removePrefillSigner = signersdata.filter(
@@ -1113,7 +1133,8 @@ function PlaceHolderSign() {
             placeholders: signerPos,
             preparedUrl: pdfUrl,
             signers,
-            signatureType: pdfDetails?.[0]?.SignatureType
+            signatureType: pdfDetails?.[0]?.SignatureType,
+            url: cleanSourceUrl
           });
           await axios.put(
             `${localStorage.getItem("baseUrl")}classes/contracts_Document/${documentId}`,
@@ -1885,6 +1906,7 @@ function PlaceHolderSign() {
       pageNumber,
       setShowRotateAlert
     );
+    setIsUploadPdf(true);
     const urlDetails = await rotatePdfPage(
       showRotateAlert.degree,
       pageNumber - 1,

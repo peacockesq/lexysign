@@ -38,6 +38,8 @@ describe("sender cancel-dialog / send-state recovery", () => {
     assert.doesNotMatch(saveFn, /SignedUrl:\s*pdfUrl/);
     assert.match(saveFn, /buildDraftSavePayload/);
     assert.match(saveFn, /preparedUrl:\s*pdfUrl/);
+    assert.match(saveFn, /url:\s*cleanSourceUrl/);
+    assert.match(saveFn, /isUploadPdf/);
     assert.doesNotMatch(saveFn, /(?<!prepared)url:\s*pdfUrl/);
     assert.equal(saveFn.includes("sendmailv3"), false);
     assert.match(saveFn, /setIsMailModal\(true\)/);
@@ -496,5 +498,88 @@ describe("sender cancel-dialog / send-state recovery", () => {
     await send.handleEmailSendToSigners();
     assert.equal(send.emailCalls.length, 1);
     assert.equal(send.state.mailStatus, "success");
+  });
+
+  it("same-tab Send after persisted expiry does not mail or PUT again", async () => {
+    const original = { ...draftDocument(), URL: "https://files.example.test/original.pdf" };
+    const memory = createPersistedDocumentStore({
+      ...original,
+      PreparedUrl: "https://files.example.test/prepared.pdf"
+    });
+    const finalize = runFinalizeInvitation(placeholderSrc, {
+      documentId: original.objectId,
+      pdfDetails: [memory.store.document],
+      contractDocument: memory.contractDocument,
+      axiosPut: memory.axiosPut
+    });
+    const share = runHandleActivateShareLink(placeholderSrc, {
+      pdfDetails: [memory.store.document],
+      finalizeInvitation: finalize.finalizeInvitation
+    });
+    await share.handleActivateShareLink({
+      objectId: "c1",
+      Email: "alpha@example.test"
+    });
+    assert.equal(share.copies.length, 1);
+    memory.store.document.ExpiryDate = { iso: "2000-01-01T00:00:00.000Z", __type: "Date" };
+    const send = runCustomizeMailSend(customizeMailSrc, {
+      mailStatus: "success",
+      beforeSend: finalize.finalizeInvitation,
+      contractDocument: memory.contractDocument
+    });
+    await send.handleEmailSendToSigners();
+    const signedPuts = memory.store.puts.filter((row) => row.data && row.data.SignedUrl);
+    assert.equal(send.emailCalls.length, 0);
+    assert.equal(send.state.loader, false);
+    assert.equal(signedPuts.length, 1);
+    assert.equal(send.alerts[0], "Expired documents cannot be sent again.");
+  });
+
+  it("malformed persisted expiry on a matching receipt does not authorize mail", async () => {
+    const original = { ...draftDocument(), URL: "https://files.example.test/original.pdf" };
+    const memory = createPersistedDocumentStore({
+      ...original,
+      PreparedUrl: "https://files.example.test/prepared.pdf"
+    });
+    const finalize = runFinalizeInvitation(placeholderSrc, {
+      documentId: original.objectId,
+      pdfDetails: [memory.store.document],
+      contractDocument: memory.contractDocument,
+      axiosPut: memory.axiosPut
+    });
+    await finalize.finalizeInvitation();
+    memory.store.document.ExpiryDate = { iso: "not-a-date", __type: "Date" };
+    const send = runCustomizeMailSend(customizeMailSrc, {
+      mailStatus: "success",
+      beforeSend: finalize.finalizeInvitation,
+      contractDocument: memory.contractDocument
+    });
+    await send.handleEmailSendToSigners();
+    assert.equal(send.emailCalls.length, 0);
+    assert.equal(send.state.loader, false);
+    assert.equal(send.state.mailStatus, null);
+  });
+
+  it("Next with a changed editor PDF persists clean URL and PreparedUrl together", async () => {
+    const original = draftDocument();
+    const memory = createPersistedDocumentStore(original);
+    const save = runSaveDocumentDetails(placeholderSrc, {
+      pdfUrl: "https://files.example.test/prepared.pdf",
+      documentId: original.objectId,
+      pdfDetails: [original],
+      signersdata: [{ Email: "alpha@example.test", objectId: "c1", Role: "signer" }],
+      axiosPut: memory.axiosPut,
+      isUploadPdf: true,
+      pdfBase64Url: "dGVzdA==",
+      convertBase64ToFile: async () => "https://files.example.test/clean-rotated.pdf"
+    });
+    await save.saveDocumentDetails();
+    assert.equal(save.state.isMailModal, true);
+    assert.equal(save.puts[0].data.URL, "https://files.example.test/clean-rotated.pdf");
+    assert.equal(save.puts[0].data.PreparedUrl, "https://files.example.test/prepared.pdf");
+    assert.equal(memory.store.document.URL, "https://files.example.test/clean-rotated.pdf");
+    assert.equal(memory.store.document.PreparedUrl, "https://files.example.test/prepared.pdf");
+    assert.equal(memory.store.document.SignedUrl, undefined);
+    assert.equal(save.state.pdfDetails[0].URL, "https://files.example.test/clean-rotated.pdf");
   });
 });

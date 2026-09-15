@@ -87,6 +87,14 @@ if argv[:1] == ["inspect"]:
     if not doc:
         state_path.write_text(json.dumps(state))
         sys.exit(1)
+    seq = (state.get("health_seq") or {}).get(name)
+    if seq and state.get("released"):
+        idx_map = state.setdefault("health_idx", {})
+        idx = idx_map.get(name, 0)
+        status = seq[min(idx, len(seq) - 1)]
+        idx_map[name] = idx + 1
+        doc = json.loads(json.dumps(doc))
+        doc.setdefault("State", {}).setdefault("Health", {})["Status"] = status
     sys.stdout.write(json.dumps([doc]))
     state_path.write_text(json.dumps(state))
     sys.exit(0)
@@ -129,6 +137,8 @@ if "up" in argv:
             doc["State"]["Restarting"] = False
             doc["State"]["Dead"] = False
             doc["State"]["Health"] = {"Status": "healthy"}
+    if state.get("health_seq"):
+        state["released"] = True
     if state.get("mismatch_after_up"):
         for doc in state.get("containers", {}).values():
             doc["Config"]["Image"] = "ghcr.io/peacockesq/lexysign-client:wrong-tag"
@@ -204,7 +214,12 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def write_mongo_archive(path: Path, payload: bytes = b"mdmp\x00archive") -> None:
+NATIVE_MONGO_MAGIC = bytes.fromhex("6de29981")
+
+
+def write_mongo_archive(path: Path, payload: bytes | None = None) -> None:
+    if payload is None:
+        payload = NATIVE_MONGO_MAGIC + b"\x00archive"
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wb") as handle:
         handle.write(payload)
@@ -231,6 +246,7 @@ def identity(target: str) -> dict[str, str]:
             "mongo_container": "lexysign-mongo",
             "network_name": "lexysign_lexysign",
             "files_volume": "lexysign_lexysign-files",
+            "mongo_volume": "lexysign_lexysign-mongo",
             "image_tag": PROD_TAG,
         }
     return {
@@ -241,6 +257,7 @@ def identity(target: str) -> dict[str, str]:
         "mongo_container": "lexysign-staging-mongo",
         "network_name": "lexysign-staging_lexysign",
         "files_volume": "lexysign-staging_lexysign-files",
+        "mongo_volume": "lexysign-staging_lexysign-mongo",
         "image_tag": STAGING_TAG,
     }
 
@@ -364,6 +381,13 @@ def compose_config_for(target: str, image_tag: str, smtp: dict[str, str], *, ser
     server_container = server_name or ident["server_container"]
     return {
         "name": ident["project_name"],
+        "networks": {
+            "lexysign": {"name": ident["network_name"]},
+        },
+        "volumes": {
+            "lexysign-files": {"name": ident["files_volume"]},
+            "lexysign-mongo": {"name": ident["mongo_volume"]},
+        },
         "services": {
             "server": {
                 "image": f"ghcr.io/peacockesq/lexysign-server:{image_tag}",
@@ -376,19 +400,32 @@ def compose_config_for(target: str, image_tag: str, smtp: dict[str, str], *, ser
                 },
                 "volumes": [
                     {
-                        "source": ident["files_volume"],
+                        "type": "volume",
+                        "source": "lexysign-files",
                         "target": "/usr/src/app/files",
                     }
                 ],
-                "networks": {"lexysign": {}},
+                "networks": {"lexysign": None},
                 "privileged": False,
             },
             "client": {
                 "image": f"ghcr.io/peacockesq/lexysign-client:{image_tag}",
                 "container_name": ident["client_container"],
-                "networks": {"lexysign": {}},
+                "networks": {"lexysign": None},
                 "privileged": False,
                 "volumes": [],
+            },
+            "mongo": {
+                "image": "mongo:7.0",
+                "container_name": ident["mongo_container"],
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "lexysign-mongo",
+                        "target": "/data/db",
+                    }
+                ],
+                "networks": {"lexysign": None},
             },
         },
     }
@@ -411,6 +448,7 @@ def make_harness(
     mailpit_relay: str | None = None,
     curl_exit: dict[str, int] | None = None,
     prior_deploy_env: str | None = None,
+    health_seq: dict[str, list[str]] | None = None,
 ) -> dict:
     ident = identity(target)
     fsroot = tmp / "fsroot"
@@ -498,6 +536,7 @@ def make_harness(
         "service_containers": {"client": client, "server": server},
         "http": http_map,
         "curl_exit": curl_exit or {},
+        "health_seq": health_seq or {},
         "compose_config": compose_config_for(target, image_tag, smtp, server_name=server_container_name),
         "containers": containers,
         "images": {},
@@ -518,6 +557,8 @@ def make_harness(
             "LEXYSIGN_HTTP_MAX_TIME": "2",
             "LEXYSIGN_PULL_TIMEOUT": "5",
             "LEXYSIGN_UP_TIMEOUT": "5",
+            "LEXYSIGN_HEALTH_TIMEOUT": "2",
+            "LEXYSIGN_HEALTH_POLL": "0",
             "TARGET": target,
             "GITHUB_SHA": SHA,
             "GITHUB_RUN_ID": "test-run",
@@ -941,6 +982,85 @@ def _():
         assert data["image_swap_reverts_schema"] is False
 
 
+def _staging_backup_with_mongo(root: Path, *, payload: bytes | None = None, raw_gzip: bytes | None = None) -> Path:
+    (root / "deploy" / "lexysign").mkdir(parents=True, exist_ok=True)
+    manifest = write_valid_backup(root, "staging")
+    data = json.loads(manifest.read_text())
+    mongo = Path(data["mongo_dump"])
+    if raw_gzip is not None:
+        mongo.write_bytes(raw_gzip)
+    else:
+        write_mongo_archive(mongo, payload)
+    blob = mongo.read_bytes()
+    data["mongo_dump_sha256"] = sha256_bytes(blob)
+    data["mongo_dump_bytes"] = len(blob)
+    manifest.write_text(json.dumps(data))
+    return manifest
+
+
+@test("backup_native_mongo_header_passes")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        manifest = _staging_backup_with_mongo(root, payload=NATIVE_MONGO_MAGIC + b"\x00" * 64)
+        app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW)
+
+
+@test("backup_mdmp_junk_rejected")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        manifest = _staging_backup_with_mongo(root, payload=b"mdmp\x00junk")
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "mdmp junk",
+        )
+
+
+@test("backup_mongo_trailer_crc_corrupt_fails")
+def _():
+    payload = NATIVE_MONGO_MAGIC + (b"x" * 50000)
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as handle:
+        handle.write(payload)
+    raw_gzip = bytearray(buf.getvalue())
+    raw_gzip[-4:] = bytes(byte ^ 0xFF for byte in raw_gzip[-4:])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        manifest = _staging_backup_with_mongo(root, raw_gzip=bytes(raw_gzip))
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "CRC-corrupt",
+        )
+
+
+@test("backup_mongo_tail_truncated_fails")
+def _():
+    payload = NATIVE_MONGO_MAGIC + (b"y" * 20000)
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as handle:
+        handle.write(payload)
+    truncated = buf.getvalue()[:-16]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        manifest = _staging_backup_with_mongo(root, raw_gzip=truncated)
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "truncated",
+        )
+
+
+@test("mongo_gzip_verifier_does_not_read_whole_file")
+def _():
+    import inspect as pyinspect
+
+    source = pyinspect.getsource(app._verify_mongo_gzip)
+    assert "read_bytes" not in source
+
+
 @test("docker_guard_refuses_caddy")
 def _():
     cfg = cfg_for("staging", "/opt/lexysign-staging")
@@ -1001,6 +1121,65 @@ def _():
     cfg = cfg_for("staging", "/opt/lexysign-staging")
     compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"}, server_name="lexysign-caddy")
     expect_raises(lambda: app.validate_compose_scope(cfg, compose), app.ReleaseError, "container_name")
+
+
+@test("compose_scope_accepts_real_shaped_staging_and_production")
+def _():
+    staging = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"})
+    app.validate_compose_scope(cfg_for("staging", "/opt/lexysign-staging"), staging)
+    production = compose_config_for(
+        "production",
+        PROD_TAG,
+        {"SMTP_HOST": "email-smtp.us-east-1.amazonaws.com", "SMTP_PORT": "587", "SMTP_ENABLE": "true"},
+    )
+    app.validate_compose_scope(cfg_for("production", "/opt/lexysign"), production)
+
+
+@test("compose_scope_rejects_staging_alias_to_production_volume")
+def _():
+    compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"})
+    compose["volumes"]["lexysign-files"]["name"] = "lexysign_lexysign-files"
+    expect_raises(
+        lambda: app.validate_compose_scope(cfg_for("staging", "/opt/lexysign-staging"), compose),
+        app.ReleaseError,
+        "lexysign-files",
+    )
+
+
+@test("compose_scope_rejects_files_alias_wrong_target")
+def _():
+    compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"})
+    compose["services"]["server"]["volumes"] = [
+        {"type": "volume", "source": "lexysign-files", "target": "/var/wrong"}
+    ]
+    expect_raises(
+        lambda: app.validate_compose_scope(cfg_for("staging", "/opt/lexysign-staging"), compose),
+        app.ReleaseError,
+        "exactly one persistent files mount",
+    )
+
+
+@test("compose_scope_rejects_conflicting_files_mounts")
+def _():
+    compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"})
+    pair = {"type": "volume", "source": "lexysign-files", "target": "/usr/src/app/files"}
+    compose["services"]["server"]["volumes"] = [pair, dict(pair)]
+    expect_raises(
+        lambda: app.validate_compose_scope(cfg_for("staging", "/opt/lexysign-staging"), compose),
+        app.ReleaseError,
+        "exactly one persistent files mount",
+    )
+
+
+@test("compose_scope_rejects_mongo_alias_to_other_target")
+def _():
+    compose = compose_config_for("staging", STAGING_TAG, {"SMTP_HOST": "mailpit", "SMTP_PORT": "1025", "SMTP_ENABLE": "true"})
+    compose["volumes"]["lexysign-mongo"]["name"] = "lexysign_lexysign-mongo"
+    expect_raises(
+        lambda: app.validate_compose_scope(cfg_for("staging", "/opt/lexysign-staging"), compose),
+        app.ReleaseError,
+        "lexysign-mongo",
+    )
 
 
 @test("live_container_exited_fails_despite_image_labels")
@@ -1242,6 +1421,69 @@ def _():
         proc = run_helper(harness)
         assert proc.returncode == 25, proc.stderr
         assert "not running" in proc.stderr
+
+
+@test("release_health_starting_then_healthy")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            health_seq={
+                "lexysign-staging-client": ["starting", "healthy"],
+                "lexysign-staging-server": ["starting", "healthy"],
+            },
+            extra_env={"LEXYSIGN_HEALTH_TIMEOUT": "2", "LEXYSIGN_HEALTH_POLL": "0"},
+        )
+        proc = run_helper(harness)
+        assert proc.returncode == 0, proc.stderr
+
+
+@test("release_health_stuck_starting_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            health_seq={
+                "lexysign-staging-client": ["starting"],
+                "lexysign-staging-server": ["starting"],
+            },
+            extra_env={"LEXYSIGN_HEALTH_TIMEOUT": "0.15", "LEXYSIGN_HEALTH_POLL": "0.05"},
+        )
+        proc = run_helper(harness)
+        assert proc.returncode == 25, proc.stderr
+        assert "still starting" in proc.stderr
+
+
+@test("release_health_unhealthy_fails")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            health_seq={
+                "lexysign-staging-client": ["unhealthy"],
+                "lexysign-staging-server": ["unhealthy"],
+            },
+        )
+        proc = run_helper(harness)
+        assert proc.returncode == 25, proc.stderr
+        assert "not healthy" in proc.stderr
+
+
+@test("release_health_mismatch_fails_immediately")
+def _():
+    with tempfile.TemporaryDirectory() as raw:
+        harness = make_harness(
+            Path(raw),
+            mismatch_after_up=True,
+            health_seq={
+                "lexysign-staging-client": ["starting"],
+                "lexysign-staging-server": ["starting"],
+            },
+            extra_env={"LEXYSIGN_HEALTH_TIMEOUT": "30", "LEXYSIGN_HEALTH_POLL": "5"},
+        )
+        proc = run_helper(harness)
+        assert proc.returncode == 25, proc.stderr
+        assert "still starting" not in proc.stderr
 
 
 @test("release_production_requires_backup_and_allows_ses")

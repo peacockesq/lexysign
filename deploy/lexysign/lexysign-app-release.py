@@ -49,11 +49,18 @@ FORBIDDEN_DOCKER_TOKENS = (
     "compose_profiles",
 )
 APP_SERVICES = frozenset({"server", "client"})
-MONGO_ARCHIVE_MAGIC = b"mdmp"
+# Native mongodump --archive stream magic (mongo-tools archive header), not "mdmp".
+MONGO_ARCHIVE_MAGIC = bytes.fromhex("6de29981")
+INVENTED_MDMP_MAGIC = b"mdmp"
 BACKUP_MAX_AGE = timedelta(hours=24)
 BACKUP_FUTURE_SKEW = timedelta(minutes=5)
 FILES_MOUNT = "/usr/src/app/files"
 MONGO_URI = "mongodb://mongo:27017/lexysign"
+COMPOSE_NETWORK_ALIAS = "lexysign"
+COMPOSE_FILES_VOLUME_ALIAS = "lexysign-files"
+COMPOSE_MONGO_VOLUME_ALIAS = "lexysign-mongo"
+MONGO_DATA_MOUNT = "/data/db"
+GZIP_CHUNK = 1024 * 1024
 SECRET_ENV_KEYS = frozenset(
     {
         "MASTER_KEY",
@@ -85,6 +92,7 @@ EXPECTED = {
         "mongo_container": "lexysign-mongo",
         "network_name": "lexysign_lexysign",
         "files_volume": "lexysign_lexysign-files",
+        "mongo_volume": "lexysign_lexysign-mongo",
     },
     "staging": {
         "prefix": "staging",
@@ -96,6 +104,7 @@ EXPECTED = {
         "mongo_container": "lexysign-staging-mongo",
         "network_name": "lexysign-staging_lexysign",
         "files_volume": "lexysign-staging_lexysign-files",
+        "mongo_volume": "lexysign-staging_lexysign-mongo",
     },
 }
 
@@ -341,21 +350,34 @@ def _require_regular_file(path: Path, backups_root: Path, label: str) -> None:
 
 
 def _verify_mongo_gzip(path: Path) -> None:
-    header = path.read_bytes()[:2]
-    if header != b"\x1f\x8b":
-        raise ReleaseError("mongo_dump is not a gzip archive (missing gzip magic)", 23)
-    try:
-        with gzip.open(path, "rb") as handle:
-            magic = handle.read(4)
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
-        raise ReleaseError(
-            "mongo_dump gzip is truncated or not a valid gzip archive", 23
-        ) from exc
-    if magic != MONGO_ARCHIVE_MAGIC:
-        raise ReleaseError(
-            "mongo_dump decompressed header is not a mongodump archive (expected mdmp magic)",
-            23,
-        )
+    with path.open("rb") as raw:
+        gzip_magic = raw.read(2)
+        if gzip_magic != b"\x1f\x8b":
+            raise ReleaseError("mongo_dump is not a gzip archive (missing gzip magic)", 23)
+        raw.seek(0)
+        try:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as handle:
+                magic = handle.read(4)
+                if magic == INVENTED_MDMP_MAGIC:
+                    raise ReleaseError(
+                        "mongo_dump header is invented mdmp junk, not native mongodump archive magic 6de29981",
+                        23,
+                    )
+                if magic != MONGO_ARCHIVE_MAGIC:
+                    raise ReleaseError(
+                        "mongo_dump decompressed header is not a native mongodump archive "
+                        "(expected 4-byte magic 6de29981)",
+                        23,
+                    )
+                while handle.read(GZIP_CHUNK):
+                    pass
+        except ReleaseError:
+            raise
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise ReleaseError(
+                "mongo_dump gzip is truncated, CRC-corrupt, or not a valid gzip archive",
+                23,
+            ) from exc
 
 
 def _verify_files_tar(path: Path) -> None:
@@ -750,6 +772,18 @@ def _volume_target(item: Any) -> str:
     return ""
 
 
+def _resolved_resource_name(section: Any, alias: str) -> str | None:
+    if not isinstance(section, dict) or alias not in section:
+        return None
+    entry = section.get(alias)
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if not name:
+        return None
+    return str(name)
+
+
 def validate_compose_scope(cfg: Mapping[str, str], compose: Mapping[str, Any]) -> None:
     if compose.get("name") != cfg["project_name"]:
         raise ReleaseError(
@@ -758,6 +792,20 @@ def validate_compose_scope(cfg: Mapping[str, str], compose: Mapping[str, Any]) -
         )
     services = compose.get("services") or {}
     layout = expected_layout(cfg["target"])
+    files_resolved = _resolved_resource_name(compose.get("volumes"), COMPOSE_FILES_VOLUME_ALIAS)
+    if files_resolved != layout["files_volume"]:
+        raise ReleaseError(
+            f"compose volume alias {COMPOSE_FILES_VOLUME_ALIAS} resolves to {files_resolved!r}, "
+            f"not {layout['files_volume']}",
+            24,
+        )
+    net_resolved = _resolved_resource_name(compose.get("networks"), COMPOSE_NETWORK_ALIAS)
+    if net_resolved != layout["network_name"]:
+        raise ReleaseError(
+            f"compose network alias {COMPOSE_NETWORK_ALIAS} resolves to {net_resolved!r}, "
+            f"not {layout['network_name']}",
+            24,
+        )
     for kind in ("server", "client"):
         svc = services.get(kind) or {}
         wanted_name = cfg[f"{kind}_container"]
@@ -789,24 +837,62 @@ def validate_compose_scope(cfg: Mapping[str, str], compose: Mapping[str, Any]) -
                     f"compose {kind} has a shared-edge or docker socket mount; refusing",
                     24,
                 )
+        nets = svc.get("networks") or {}
+        net_keys = set(nets) if isinstance(nets, dict) else set(nets)
+        if COMPOSE_NETWORK_ALIAS not in net_keys:
+            raise ReleaseError(f"compose {kind} is not attached to the lexysign network alias", 24)
     server = services.get("server") or {}
     server_env = env_map(server.get("environment"))
     mongo_uri = server_env.get("MONGODB_URI") or server_env.get("DATABASE_URI") or ""
     if mongo_uri != MONGO_URI:
         raise ReleaseError("compose server DB destination is not mongodb://mongo:27017/lexysign", 24)
-    file_targets = [_volume_target(item) for item in server.get("volumes") or []]
-    if FILES_MOUNT not in file_targets:
-        raise ReleaseError("compose server is missing the persistent files mount", 24)
-    file_sources = [_volume_source(item) for item in server.get("volumes") or []]
-    if layout["files_volume"] not in file_sources and "lexysign-files" not in file_sources:
-        raise ReleaseError("compose server files volume identity does not match the target", 24)
-    server_nets = server.get("networks") or {}
-    if isinstance(server_nets, dict):
-        net_keys = set(server_nets)
-    else:
-        net_keys = set(server_nets)
-    if "lexysign" not in net_keys and cfg["network_name"] not in net_keys:
-        raise ReleaseError("compose server is not attached to the LexySign app network", 24)
+    mounts = server.get("volumes") or []
+    files_targets = [
+        (_volume_source(item), _volume_target(item))
+        for item in mounts
+        if _volume_target(item) == FILES_MOUNT
+    ]
+    files_alias_pairs = [
+        (_volume_source(item), _volume_target(item))
+        for item in mounts
+        if _volume_source(item) == COMPOSE_FILES_VOLUME_ALIAS
+    ]
+    if len(files_targets) != 1:
+        raise ReleaseError(
+            "compose server must have exactly one persistent files mount at /usr/src/app/files",
+            24,
+        )
+    if files_targets[0] != (COMPOSE_FILES_VOLUME_ALIAS, FILES_MOUNT):
+        raise ReleaseError(
+            "compose server files mount source/target pair is not lexysign-files -> /usr/src/app/files",
+            24,
+        )
+    if len(files_alias_pairs) != 1 or files_alias_pairs[0][1] != FILES_MOUNT:
+        raise ReleaseError(
+            "compose server lexysign-files alias is paired with an unexpected target",
+            24,
+        )
+    mongo = services.get("mongo") or {}
+    if mongo:
+        if mongo.get("container_name") != layout["mongo_container"]:
+            raise ReleaseError(
+                "compose mongo container_name routes to a different target than this release",
+                24,
+            )
+        mongo_resolved = _resolved_resource_name(compose.get("volumes"), COMPOSE_MONGO_VOLUME_ALIAS)
+        if mongo_resolved != layout["mongo_volume"]:
+            raise ReleaseError(
+                f"compose mongo volume alias {COMPOSE_MONGO_VOLUME_ALIAS} resolves to "
+                f"{mongo_resolved!r}, not {layout['mongo_volume']}",
+                24,
+            )
+        mongo_data = [
+            (_volume_source(item), _volume_target(item))
+            for item in mongo.get("volumes") or []
+            if _volume_target(item) == MONGO_DATA_MOUNT
+        ]
+        if mongo_data and mongo_data[0][0] != COMPOSE_MONGO_VOLUME_ALIAS:
+            raise ReleaseError("compose mongo data mount is not the lexysign-mongo alias", 24)
 
 
 def validate_current_contract(cfg: Mapping[str, str]) -> None:
@@ -923,25 +1009,16 @@ def assert_live_app_container(
     cfg: Mapping[str, str],
     kind: str,
     candidate: Mapping[str, str],
-) -> None:
+) -> str:
     if not doc:
         raise ReleaseError(f"{name} is not present after app release", 25)
     state = doc.get("State") or {}
     status = str(state.get("Status") or "")
-    if not state.get("Running") or state.get("Restarting") or state.get("Dead"):
+    if state.get("Dead") or not state.get("Running") or status in {"exited", "dead", "paused", "removing"}:
         raise ReleaseError(
             f"{name} is not running (status={status!r}); image/revision match is not enough",
             25,
         )
-    if status in {"exited", "dead", "paused", "restarting", "removing", "created"}:
-        raise ReleaseError(f"{name} status {status!r} is not a live app container", 25)
-    health = state.get("Health")
-    if isinstance(health, dict) and health:
-        if health.get("Status") != "healthy":
-            raise ReleaseError(
-                f"{name} healthcheck is {health.get('Status')!r}, not healthy",
-                25,
-            )
     wanted = expected_image(cfg, kind)
     config_image = (doc.get("Config") or {}).get("Image")
     if config_image != wanted:
@@ -957,12 +1034,45 @@ def assert_live_app_container(
     labels = (doc.get("Config") or {}).get("Labels") or {}
     if labels.get("org.opencontainers.image.revision") != cfg["github_sha"]:
         raise ReleaseError(f"{name} revision does not match workflow SHA", 25)
+    health = state.get("Health")
+    if not isinstance(health, dict) or not health.get("Status"):
+        raise ReleaseError(
+            f"{name} has no healthcheck status; HTTP success is not a substitute",
+            25,
+        )
+    health_status = str(health.get("Status"))
+    if health_status == "healthy":
+        return "ready"
+    if health_status == "starting":
+        return "wait"
+    raise ReleaseError(
+        f"{name} healthcheck is {health_status!r}, not healthy",
+        25,
+    )
 
 
 def verify_running_images(cfg: Mapping[str, str], candidates: Mapping[str, Mapping[str, str]]) -> None:
-    for kind, name in (("client", cfg["client_container"]), ("server", cfg["server_container"])):
-        doc = inspect_container(cfg, name)
-        assert_live_app_container(name, doc, cfg, kind, candidates[kind])
+    timeout = float(os.environ.get("LEXYSIGN_HEALTH_TIMEOUT", "120"))
+    poll = float(os.environ.get("LEXYSIGN_HEALTH_POLL", "2"))
+    deadline = time.monotonic() + max(timeout, 0)
+    pending = ["client", "server"]
+    while pending:
+        still: list[str] = []
+        for kind in pending:
+            name = cfg[f"{kind}_container"]
+            doc = inspect_container(cfg, name)
+            outcome = assert_live_app_container(name, doc, cfg, kind, candidates[kind])
+            if outcome == "wait":
+                still.append(kind)
+        if not still:
+            return
+        if time.monotonic() >= deadline:
+            raise ReleaseError(
+                f"app healthcheck did not become healthy within {timeout}s ({', '.join(still)} still starting)",
+                25,
+            )
+        time.sleep(max(poll, 0))
+        pending = still
 
 
 def http_retries() -> tuple[int, float, int]:

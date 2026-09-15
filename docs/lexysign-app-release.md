@@ -9,12 +9,12 @@ Shared-edge / Caddyfile / Caddy networks / Caddy reload is a **separate explicit
 1. Pins image tags to `prod-<sha12>` or `staging-<sha12>` from the literal lowercase workflow SHA. Arbitrary `image_tag` overrides are rejected. Pulled image id + repo digest are resolved before `compose up`; a SHA-looking tag is not treated as immutable.
 2. Builds client and server from this revision. Frontend secrets are **not** Docker build-args. Host `.env` still supplies `VITE_SUPABASE_*` for `docker-entrypoint.lexysign.sh` runtime-env.js.
 3. Copies only `lexysign-app-release.py` to the host. It does not copy or overwrite `Caddyfile` or compose files.
-4. Parses `docker compose config --format json` before mutation. Server/client must match target container names, project, pinned image, Mongo URI `mongodb://mongo:27017/lexysign`, files volume mount, and must not be privileged, host-networked, or mount a docker socket / shared-edge path.
+4. Parses `docker compose config --format json` before mutation. Volume alias `lexysign-files` and network alias `lexysign` must resolve through top-level `name` to the target's actual volume/network. Server files mount must be the pair `lexysign-files` -> `/usr/src/app/files`. Staging aliases must not resolve to production names.
 5. Staging mail is fail-closed on the **effective** compose server SMTP env, then on the live sink container: hostname `mailpit` or `lexysign-staging-mailpit`, port `1025`, shared app network, no relay/forwarding env. `.env` hostname allowlist alone is not enough.
-6. Staging **and** production require a backup manifest before replacement. Archives must be distinct regular non-symlink files under `{deploy_path}/backups/`, with SHA-256 + byte-count readback, gzip/mongodump `mdmp` magic, openable files tar, explicit `image_swap_reverts_schema: false`, timezone-aware ISO `created_at` within 24h, and source identity bound to the target project/mongo/volume/network. Non-empty junk is rejected. This is not a restore implementation.
+6. Staging **and** production require a backup manifest before replacement. Archives must be distinct regular non-symlink files under `{deploy_path}/backups/`, with SHA-256 + byte-count readback, gzip streamed to EOF (CRC), native mongodump archive magic `6de29981` (invented `mdmp` is rejected), openable files tar, explicit `image_swap_reverts_schema: false`, timezone-aware ISO `created_at` within 24h, and source identity bound to the target project/mongo/volume/network. Non-empty junk is rejected. This is not a restore implementation.
 7. Original rollback metadata and prior `.deploy.env` / HOST_URL are written once under `.release-history/` and not overwritten on retry. Preflight/pull failure leaves `.deploy.env` unchanged.
 8. `pull server` then `pull client`, then `up -d --no-deps --force-recreate server client`. No `--remove-orphans`, no Mongo recreate, no Caddy.
-9. Post-up containers must be running, not restarting/dead/exited, healthy when a healthcheck exists, and their image id must match the pulled candidate.
+9. Post-up containers must be running with the pulled image id/revision on every inspect. Healthchecks are required: `starting` may become `healthy` within 120s; `exited`/`dead`/wrong identity/`unhealthy` fail immediately. HTTP 200 is not a substitute.
 10. HTTP smoke: curl nonzero is failure even if the body/code prints 200/401. `/api/billing/status` must be unauthenticated 401.
 
 ## Operator prep (staging and production)
@@ -23,7 +23,7 @@ Cain/operator, not this helper, must:
 
 1. Staging only: provision Mailpit as `mailpit` or `lexysign-staging-mailpit` on the staging app network, SMTP `1025`, relay disabled. Point staging `.env` at that sink. Remove Amazon SES from staging. Effective compose env must resolve to the same sink.
 2. Take a real `mongodump --archive --gzip` of the **target** mongo container and a gzip tar of the **target** files volume. Store them under `/opt/lexysign[-staging]/backups/<stamp>/`.
-3. Write `{deploy}/.backup-manifest.json` (example staging):
+3. Write `/opt/lexysign-staging/deploy/lexysign/.backup-manifest.json` (production: `/opt/lexysign/deploy/lexysign/.backup-manifest.json`). Archives stay under `/opt/lexysign[-staging]/backups/<stamp>/`. Example staging:
 
 ```json
 {

@@ -6,6 +6,7 @@ import { openSignSrc, serverSrc } from "./paths.mjs";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
   evaluateFinalizeGuard,
@@ -142,12 +143,15 @@ export function runFinalizeInvitation(placeholderSrc, { documentId, pdfDetails, 
   const puts = [];
   const state = { pdfDetails };
   const localStorage = createLocalStorage();
+  const draftActivationReceiptRef = { current: null };
   const finalizeInvitation = runSourceBlock(
     block,
     {
       assertActiveSession,
       evaluateFinalizeGuard,
       buildFinalizePayload,
+      bindDraftActivationReceipt,
+      draftActivationReceiptRef,
       contractDocument,
       documentId,
       pdfDetails,

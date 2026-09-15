@@ -67,8 +67,10 @@ import * as utils from "../utils";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
+  editableSourceUrl,
   evaluateFinalizeGuard,
   shouldExposeSignerShareLinks
 } from "../utils/draftDocumentPreparation";
@@ -81,6 +83,7 @@ import { useScroll } from "../context/ScrollPdfContext";
 function PlaceHolderSign() {
   const { t } = useTranslation();
   const copyUrlRef = useRef(null);
+  const draftActivationReceiptRef = useRef(null);
   const { scrollRef } = useScroll();
   const dispatch = useDispatch();
   const windowSize = useWindowSize();
@@ -270,7 +273,9 @@ function PlaceHolderSign() {
       }
 
       setDocTitle(documentData?.[0]?.Name);
-      const url = documentData[0] && documentData[0]?.URL;
+      // Editable drafts always load URL (clean source). PreparedUrl is send-time
+      // output only and must not become the reopen/edit base PDF.
+      const url = editableSourceUrl(documentData[0]);
       //convert document url in array buffer format to use embed widgets in pdf using pdf-lib
       const arrayBuffer = await convertPdfArrayBuffer(url);
       const base64Pdf = await getBase64FromUrl(url);
@@ -1077,7 +1082,8 @@ function PlaceHolderSign() {
       alert(t("something-went-wrong-mssg"));
     }
   };
-  // Next persists a recoverable draft. Dispatch flags are written only by
+  // Next persists a recoverable draft: geometry, title, signers, and PreparedUrl.
+  // URL (clean source) is not replaced. Dispatch flags are written only by
   // finalizeInvitation on explicit Send / Share / owner-first self-sign.
   const saveDocumentDetails = utils.withSessionValidation(async () => {
     setIsUiLoading(true);
@@ -1105,7 +1111,7 @@ function PlaceHolderSign() {
           const data = buildDraftSavePayload({
             name: docTitle || pdfDetails?.[0]?.Name,
             placeholders: signerPos,
-            url: pdfUrl,
+            preparedUrl: pdfUrl,
             signers,
             signatureType: pdfDetails?.[0]?.SignatureType
           });
@@ -1158,12 +1164,15 @@ function PlaceHolderSign() {
       throw new Error(t("something-went-wrong-mssg"));
     }
     const current = documentData[0];
-    const guard = evaluateFinalizeGuard(current);
+    const guard = evaluateFinalizeGuard(current, draftActivationReceiptRef.current);
     if (!guard.ok) {
       const err = new Error(guard.message);
       err.name = "FinalizeInvitationError";
       err.code = guard.code;
       throw err;
+    }
+    if (guard.alreadyActivated) {
+      return { SignedUrl: guard.signedUrl, alreadyActivated: true };
     }
     const data = buildFinalizePayload({
       signedUrl: guard.signedUrl,
@@ -1181,6 +1190,10 @@ function PlaceHolderSign() {
         }
       }
     );
+    draftActivationReceiptRef.current = bindDraftActivationReceipt({
+      documentId,
+      signedUrl: data.SignedUrl
+    });
     if (pdfDetails?.[0]) {
       const updatedPdfDetails = [...pdfDetails];
       updatedPdfDetails[0] = {
@@ -1205,11 +1218,7 @@ function PlaceHolderSign() {
   //function show signer list and share link to share signUrl
   const handleActivateShareLink = async (signer) => {
     if (!shouldExposeSignerShareLinks(pdfDetails?.[0])) {
-      try {
-        await finalizeInvitation();
-      } catch (e) {
-        if (e?.code !== "already-dispatched") throw e;
-      }
+      await finalizeInvitation();
     }
     const objectId = signer.objectId;
     const hostUrl = window.location.origin;
@@ -1673,11 +1682,9 @@ function PlaceHolderSign() {
       try {
         await finalizeInvitation();
       } catch (e) {
-        if (e?.code !== "already-dispatched") {
-          console.log("error", e);
-          alert(e?.message || t("something-went-wrong-mssg"));
-          return;
-        }
+        console.log("error", e);
+        alert(e?.message || t("something-went-wrong-mssg"));
+        return;
       }
     }
     if (currentId) {

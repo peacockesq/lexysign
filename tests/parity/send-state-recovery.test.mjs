@@ -37,6 +37,8 @@ describe("sender cancel-dialog / send-state recovery", () => {
     assert.doesNotMatch(saveFn, /SentToOthers:\s*true/);
     assert.doesNotMatch(saveFn, /SignedUrl:\s*pdfUrl/);
     assert.match(saveFn, /buildDraftSavePayload/);
+    assert.match(saveFn, /preparedUrl:\s*pdfUrl/);
+    assert.doesNotMatch(saveFn, /(?<!prepared)url:\s*pdfUrl/);
     assert.equal(saveFn.includes("sendmailv3"), false);
     assert.match(saveFn, /setIsMailModal\(true\)/);
     const finalizeFn = sliceBetween(
@@ -46,15 +48,31 @@ describe("sender cancel-dialog / send-state recovery", () => {
     );
     assert.match(finalizeFn, /buildFinalizePayload/);
     assert.match(finalizeFn, /evaluateFinalizeGuard/);
+    assert.match(finalizeFn, /bindDraftActivationReceipt/);
+    assert.match(finalizeFn, /alreadyActivated/);
     assert.match(customizeMailSrc, /props\?\.beforeSend/);
+    assert.match(placeholderSrc, /editableSourceUrl\(documentData\[0\]\)/);
+    const shareFn = sliceBetween(
+      placeholderSrc,
+      "const handleActivateShareLink = async (signer) => {",
+      "\n  const handleShareList"
+    );
+    assert.doesNotMatch(shareFn, /already-dispatched/);
+    const recipientFn = sliceBetween(
+      placeholderSrc,
+      "const handleRecipientSign = async () => {",
+      "\n  const handleLinkUser"
+    );
+    assert.doesNotMatch(recipientFn, /already-dispatched/);
   });
 
-  it("extracted Next save persists draft fields and URL without SignedUrl, SentToOthers, or DocSentAt", async () => {
+  it("extracted Next save persists draft fields and PreparedUrl without replacing URL or writing SignedUrl", async () => {
     const observed = await runInterruptedSendSequence();
     const put = observed.put.data;
     assert.equal(Object.prototype.hasOwnProperty.call(put, "SentToOthers"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(put, "SignedUrl"), false);
-    assert.equal(put.URL, "https://files.example.test/doc.pdf");
+    assert.equal(Object.prototype.hasOwnProperty.call(put, "URL"), false);
+    assert.equal(put.PreparedUrl, "https://files.example.test/doc.pdf");
     assert.ok(Array.isArray(put.Placeholders));
     assert.ok(Array.isArray(put.Signers));
     assert.equal(put.Signers[0].objectId, "c1");
@@ -64,10 +82,13 @@ describe("sender cancel-dialog / send-state recovery", () => {
     assert.equal(persisted.SignedUrl, undefined);
     assert.equal(persisted.Name, "synthetic");
     assert.equal(persisted.DocSentAt, undefined);
+    assert.equal(persisted.URL, "https://files.example.test/original.pdf");
+    assert.equal(persisted.PreparedUrl, put.PreparedUrl);
     assert.equal(observed.persisted.provenance.putKeys.includes("SentToOthers"), false);
     assert.equal(observed.persisted.provenance.beforeSave.includes("DocSentAt"), false);
     assert.equal(observed.persisted.billing.length, 0);
-    assert.equal(observed.pdfDetailsAfterSave[0].URL, put.URL);
+    assert.equal(observed.pdfDetailsAfterSave[0].URL, "https://files.example.test/original.pdf");
+    assert.equal(observed.pdfDetailsAfterSave[0].PreparedUrl, put.PreparedUrl);
   });
 
   it("extracted CustomizeMail close navigates away without sending mail", () => {
@@ -193,7 +214,8 @@ describe("sender cancel-dialog / send-state recovery", () => {
       "draft after Next+close must remain editable for first invitation"
     );
     assert.equal(isLockedAgainstEdit(observed.placed), false);
-    assert.equal(observed.persisted.document.URL, "https://files.example.test/doc.pdf");
+    assert.equal(observed.persisted.document.URL, "https://files.example.test/original.pdf");
+    assert.equal(observed.persisted.document.PreparedUrl, "https://files.example.test/doc.pdf");
     assert.equal(observed.persisted.document.Placeholders[0].Id, "ph-alpha");
   });
 
@@ -201,8 +223,11 @@ describe("sender cancel-dialog / send-state recovery", () => {
     const observed = await runNextCloseReopenSendSequence({ mailStatus: "success" });
     assert.equal(observed.afterNext.billing.length, 0);
     assert.equal(Object.prototype.hasOwnProperty.call(observed.afterNext.put.data, "SignedUrl"), false);
-    assert.equal(observed.afterNext.document.URL, "https://files.example.test/doc.pdf");
-    assert.equal(observed.afterNext.pdfDetails[0].URL, "https://files.example.test/doc.pdf");
+    assert.equal(Object.prototype.hasOwnProperty.call(observed.afterNext.put.data, "URL"), false);
+    assert.equal(observed.afterNext.document.URL, "https://files.example.test/original.pdf");
+    assert.equal(observed.afterNext.document.PreparedUrl, "https://files.example.test/doc.pdf");
+    assert.equal(observed.afterNext.pdfDetails[0].URL, "https://files.example.test/original.pdf");
+    assert.equal(observed.afterNext.pdfDetails[0].PreparedUrl, "https://files.example.test/doc.pdf");
     assert.equal(isLockedAgainstEdit(observed.placed), false);
     assert.equal(observed.close.state.isMailModal, false);
     assert.equal(observed.send.emailCalls.length, 1);
@@ -356,5 +381,120 @@ describe("sender cancel-dialog / send-state recovery", () => {
     await send.handleEmailSendToSigners();
     assert.equal(send.emailCalls.length, 0);
     assert.equal(send.state.isSend, false);
+  });
+
+  it("Share without a same-draft receipt does not copy after already-dispatched", async () => {
+    const original = {
+      ...draftDocument(),
+      URL: "https://files.example.test/original.pdf",
+      SignedUrl: "https://files.example.test/historical.pdf"
+    };
+    const memory = createPersistedDocumentStore(original);
+    const finalize = runFinalizeInvitation(placeholderSrc, {
+      documentId: original.objectId,
+      pdfDetails: [{ ...original, SignedUrl: undefined }],
+      contractDocument: memory.contractDocument,
+      axiosPut: memory.axiosPut
+    });
+    const share = runHandleActivateShareLink(placeholderSrc, {
+      pdfDetails: [{ ...original, SignedUrl: undefined }],
+      finalizeInvitation: finalize.finalizeInvitation
+    });
+    await assert.rejects(
+      () =>
+        share.handleActivateShareLink({
+          objectId: "c1",
+          Email: "alpha@example.test"
+        }),
+      /already sent/
+    );
+    assert.equal(share.copies.length, 0);
+    const signedPuts = memory.store.puts.filter((row) => row.data && row.data.SignedUrl);
+    assert.equal(signedPuts.length, 0);
+  });
+
+  it("Share then first Send in the same tab activates once and still sends mail", async () => {
+    const original = { ...draftDocument(), URL: "https://files.example.test/original.pdf" };
+    const memory = createPersistedDocumentStore({
+      ...original,
+      PreparedUrl: "https://files.example.test/prepared.pdf"
+    });
+    const finalize = runFinalizeInvitation(placeholderSrc, {
+      documentId: original.objectId,
+      pdfDetails: [memory.store.document],
+      contractDocument: memory.contractDocument,
+      axiosPut: memory.axiosPut
+    });
+    const share = runHandleActivateShareLink(placeholderSrc, {
+      pdfDetails: [memory.store.document],
+      finalizeInvitation: finalize.finalizeInvitation
+    });
+    await share.handleActivateShareLink({
+      objectId: "c1",
+      Email: "alpha@example.test"
+    });
+    const send = runCustomizeMailSend(customizeMailSrc, {
+      mailStatus: "success",
+      beforeSend: finalize.finalizeInvitation,
+      contractDocument: memory.contractDocument
+    });
+    await send.handleEmailSendToSigners();
+    const signedPuts = memory.store.puts.filter((row) => row.data && row.data.SignedUrl);
+    assert.equal(share.copies.length, 1);
+    assert.equal(send.emailCalls.length, 1);
+    assert.equal(send.alerts.length, 0);
+    assert.equal(signedPuts.length, 1);
+    assert.equal(signedPuts[0].data.SignedUrl, "https://files.example.test/prepared.pdf");
+    assert.equal(memory.store.document.URL, "https://files.example.test/original.pdf");
+  });
+
+  it("same-tab retry after finalize then failed-before-mail sends once without a second activation PUT", async () => {
+    const original = {
+      ...draftDocument(),
+      URL: "https://files.example.test/original.pdf",
+      PreparedUrl: "https://files.example.test/prepared.pdf"
+    };
+    const memory = createPersistedDocumentStore(original);
+    const finalize = runFinalizeInvitation(placeholderSrc, {
+      documentId: original.objectId,
+      pdfDetails: [memory.store.document],
+      contractDocument: memory.contractDocument,
+      axiosPut: memory.axiosPut
+    });
+    let reads = 0;
+    const send = runCustomizeMailSend(customizeMailSrc, {
+      mailStatus: "success",
+      beforeSend: finalize.finalizeInvitation,
+      contractDocument: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("synthetic post-finalize read failure");
+        return memory.contractDocument();
+      }
+    });
+    await send.handleEmailSendToSigners();
+    assert.equal(send.emailCalls.length, 0);
+    assert.equal(send.state.loader, false);
+    await send.handleEmailSendToSigners();
+    const signedPuts = memory.store.puts.filter((row) => row.data && row.data.SignedUrl);
+    assert.equal(signedPuts.length, 1);
+    assert.equal(send.emailCalls.length, 1);
+    assert.equal(send.state.mailStatus, "success");
+  });
+
+  it("legacy CustomizeMail without beforeSend still sends when SignedUrl is already present", async () => {
+    const send = runCustomizeMailSend(customizeMailSrc, {
+      mailStatus: "success",
+      contractDocument: async () => [
+        {
+          SignedUrl: "https://files.example.test/doc.pdf",
+          SendinOrder: false,
+          ExtUserPtr: { Email: "owner@example.test" },
+          Signers: []
+        }
+      ]
+    });
+    await send.handleEmailSendToSigners();
+    assert.equal(send.emailCalls.length, 1);
+    assert.equal(send.state.mailStatus, "success");
   });
 });

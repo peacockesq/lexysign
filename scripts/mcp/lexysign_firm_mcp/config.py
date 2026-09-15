@@ -11,6 +11,8 @@ from .errors import FirmMcpError
 MAX_PDF_BYTES_DEFAULT = 25 * 1024 * 1024
 MAX_PAGE_LIMIT = 50
 ALLOWED_SCHEMES = {"http", "https"}
+MAX_SIGNERS = 25
+MAX_WIDGETS = 80
 
 
 def _read_json(path: Path) -> dict:
@@ -71,6 +73,7 @@ class FirmConfig:
     approval_ttl_seconds: int
     http_timeout_seconds: float
     page_limit: int
+    object_storage_origins: tuple[str, ...]
 
     @property
     def session_fingerprint(self) -> str:
@@ -98,6 +101,15 @@ def load_config(path: str | os.PathLike[str] | None = None) -> FirmConfig:
     page_limit = int(data.get("page_limit") or MAX_PAGE_LIMIT)
     if page_limit < 1 or page_limit > MAX_PAGE_LIMIT:
         page_limit = MAX_PAGE_LIMIT
+    origins_raw = data.get("object_storage_origins") or []
+    if origins_raw and not isinstance(origins_raw, list):
+        raise FirmMcpError("invalid_config", "object_storage_origins must be a list")
+    origins: list[str] = []
+    for item in origins_raw:
+        parsed_origin = urlparse(str(item))
+        if parsed_origin.scheme != "https" or not parsed_origin.netloc or parsed_origin.username or parsed_origin.password:
+            raise FirmMcpError("invalid_config", "object storage origins must be https hosts")
+        origins.append(f"https://{parsed_origin.netloc}")
     return FirmConfig(
         parse_base_url=base,
         parse_app_id=_require_str(data, "parse_app_id"),
@@ -115,4 +127,5 @@ def load_config(path: str | os.PathLike[str] | None = None) -> FirmConfig:
         approval_ttl_seconds=int(data.get("approval_ttl_seconds") or 1800),
         http_timeout_seconds=float(data.get("http_timeout_seconds") or 30),
         page_limit=page_limit,
+        object_storage_origins=tuple(origins),
     )

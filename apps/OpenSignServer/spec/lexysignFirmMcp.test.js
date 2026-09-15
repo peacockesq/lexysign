@@ -9,6 +9,8 @@ describe('LexySign firm MCP native send registration', () => {
     const main = read('../cloud/main.js');
     assert.match(main, /import lexysignFirmSendInvitations from '\.\/parsefunction\/lexysignFirmSendInvitations\.js'/);
     assert.match(main, /Parse\.Cloud\.define\('lexysignFirmSendInvitations', lexysignFirmSendInvitations\)/);
+    assert.match(main, /import lexysignFirmAcquireFile from '\.\/parsefunction\/lexysignFirmAcquireFile\.js'/);
+    assert.match(main, /Parse\.Cloud\.define\('lexysignFirmAcquireFile', lexysignFirmAcquireFile\)/);
   });
 
   it('keeps owner, tenant, lifecycle, and smtp-accepted-not-delivered guards', () => {
@@ -23,5 +25,8 @@ describe('LexySign firm MCP native send registration', () => {
     assert.match(send, /sendMode === 'manual'/);
     assert.match(send, /appPublicUrl/);
     assert.match(send, /request\.user/);
+    assert.match(send, /LEXYSIGN_FIRM_APPROVAL_SECRET/);
+    assert.match(send, /lexysign_FirmSendReservation/);
+    assert.match(send, /firmQuotaAlreadyReserved/);
   });
 });

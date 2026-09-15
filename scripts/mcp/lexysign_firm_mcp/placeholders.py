@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .config import MAX_SIGNERS, MAX_WIDGETS
 from .errors import FirmMcpError
 from .pdfutil import validate_rect
 
@@ -32,6 +33,8 @@ def pointer(class_name: str, object_id: str) -> dict:
 def build_placeholders(*, signers: list[dict], contacts: list[dict], pages: list[dict]) -> list[dict]:
     if not signers:
         raise FirmMcpError("bad_bounds", "at least one signer is required")
+    if len(signers) > MAX_SIGNERS:
+        raise FirmMcpError("bad_bounds", "too many signers")
     page_by_no = {int(item["page"]): item for item in pages}
     placeholders = []
     widget_key = 1
@@ -39,6 +42,8 @@ def build_placeholders(*, signers: list[dict], contacts: list[dict], pages: list
         fields = signer.get("fields")
         if not isinstance(fields, list) or not fields:
             raise FirmMcpError("bad_bounds", "each signer needs explicit field coordinates")
+        if widget_key - 1 + len(fields) > MAX_WIDGETS:
+            raise FirmMcpError("bad_bounds", "too many widgets")
         role = str(signer.get("role") or "signer")
         if role == "prefill":
             raise FirmMcpError("tag_parse_unsupported", "prefill/tag parsing is not supported; pass explicit coordinates")

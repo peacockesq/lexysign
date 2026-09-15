@@ -96,8 +96,7 @@ def test_sdk_initialize_list_and_tools(harness):
                     }
 
     result = asyncio.run(exercise())
-    evidence = Path("/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/mcp-v1-evidence")
-    evidence.mkdir(parents=True, exist_ok=True)
-    (evidence / "sdk-transport.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    evidence = harness["tmp"] / "sdk-transport.json"
+    evidence.write_text(json.dumps(result, indent=2), encoding="utf-8")
     assert result["server"] == "lexysign-firm"
     assert len(result["tools"]) == 7

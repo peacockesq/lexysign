@@ -71,7 +71,7 @@ def test_expired_approval_rejects(harness):
     from lexysign_firm_mcp.approval import _sign
     from lexysign_firm_mcp.manifest import canonical
 
-    unsigned = {key: value for key, value in payload.items() if key != "hmac"}
+    unsigned = {key: value for key, value in payload.items() if key not in {"hmac", "native_hmac"}}
     payload["hmac"] = _sign(harness["config"].approval_secret, unsigned)
     path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     with pytest.raises(FirmMcpError) as raised:

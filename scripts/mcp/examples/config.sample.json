@@ -14,5 +14,6 @@
   "manifest_ttl_seconds": 3600,
   "approval_ttl_seconds": 1800,
   "http_timeout_seconds": 30,
-  "page_limit": 50
+  "page_limit": 50,
+  "object_storage_origins": []
 }

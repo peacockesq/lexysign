@@ -8,7 +8,31 @@ import httpx
 
 from .config import FirmConfig
 from .errors import FirmMcpError
+from .pdfutil import parse_pages
 from .placeholders import pointer
+from .redact import public_error
+
+KNOWN_NATIVE_CODES = {
+    "foreign_document",
+    "other_tenant",
+    "payload_modified",
+    "document_terminal",
+    "document_expired",
+    "duplicate_send",
+    "approval_missing",
+    "approval_unconfigured",
+    "approval_expired",
+    "approval_mismatch",
+    "reservation_unprovisioned",
+    "foreign_contact",
+    "invalid_origin",
+    "missing_signers",
+    "insufficient_quota",
+    "not_completed",
+    "missing_url",
+    "invalid_session",
+    "uncertain",
+}
 
 
 def _pointer_id(value: Any) -> str:
@@ -24,11 +48,13 @@ def _pointer_id(value: Any) -> str:
 class ParseClient:
     def __init__(self, config: FirmConfig, transport: httpx.BaseTransport | None = None) -> None:
         self.config = config
+        self._transport = transport
         self._client = httpx.Client(
             base_url=config.parse_base_url,
             timeout=config.http_timeout_seconds,
             transport=transport,
             follow_redirects=False,
+            trust_env=False,
             headers={
                 "X-Parse-Application-Id": config.parse_app_id,
                 "X-Parse-Session-Token": config.session_token,
@@ -38,17 +64,33 @@ class ParseClient:
     def close(self) -> None:
         self._client.close()
 
-    def _url_ok(self, url: str) -> None:
-        parsed = urlparse(str(url))
+    def _parse_host_ok(self, parsed) -> bool:
         allowed = urlparse(self.config.parse_base_url)
-        if parsed.scheme not in {"http", "https"}:
-            raise FirmMcpError("invalid_config", "refusing non-http URL")
-        if parsed.netloc != allowed.netloc:
-            raise FirmMcpError("invalid_config", "refusing host outside configured Parse base")
+        return parsed.scheme == allowed.scheme and parsed.netloc == allowed.netloc
+
+    def _storage_ok(self, parsed) -> bool:
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            return False
+        origin = f"https://{parsed.netloc}"
+        return origin in self.config.object_storage_origins
+
+    def _validate_capability_url(self, url: str) -> None:
+        parsed = urlparse(str(url))
+        if parsed.username or parsed.password or parsed.fragment:
+            raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
+        if self._parse_host_ok(parsed):
+            if "/files/" not in parsed.path:
+                raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
+            return
+        if self._storage_ok(parsed):
+            return
+        raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
 
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         if path.startswith("http://") or path.startswith("https://"):
-            self._url_ok(path)
+            parsed = urlparse(path)
+            if not self._parse_host_ok(parsed):
+                raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
@@ -57,21 +99,41 @@ class ParseClient:
             raise FirmMcpError("send_timeout", "Parse transport failed") from exc
         return response
 
+    def _raise_parse(self, response: httpx.Response) -> None:
+        if response.status_code == 209 or (
+            response.status_code in {400, 401} and "session" in response.text.lower()
+        ):
+            raise FirmMcpError("invalid_session", public_error("invalid_session"))
+        payload: dict[str, Any]
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        code = payload.get("code")
+        message = str(payload.get("error") or payload.get("message") or "")
+        prefix = message.split(":", 1)[0].strip()
+        if code == 209:
+            raise FirmMcpError("invalid_session", public_error("invalid_session"))
+        if prefix in KNOWN_NATIVE_CODES:
+            mapped = "uncertain_send" if prefix == "uncertain" else prefix
+            if mapped == "insufficient_quota" or "limit reached" in message.lower() or "subscription" in message.lower():
+                raise FirmMcpError("insufficient_quota" if "subscription" in message.lower() or "limit" in message.lower() else mapped, public_error(mapped))
+            raise FirmMcpError(mapped, public_error(mapped))
+        if code == 137:
+            raise FirmMcpError("duplicate_send", public_error("duplicate_send"))
+        if code == 119:
+            if "subscription" in message.lower() or "limit" in message.lower():
+                raise FirmMcpError("insufficient_quota", public_error("insufficient_quota"))
+            raise FirmMcpError("forbidden", public_error("forbidden"))
+        raise FirmMcpError("invalid_config", public_error("invalid_config"))
+
     def _json(self, response: httpx.Response) -> Any:
         if response.status_code == 209 or (
             response.status_code in {400, 401} and "session" in response.text.lower()
         ):
-            raise FirmMcpError("invalid_session", "Parse session was refused")
+            raise FirmMcpError("invalid_session", public_error("invalid_session"))
         if response.status_code >= 400:
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {"error": response.text[:200]}
-            code = payload.get("code")
-            message = payload.get("error") or payload.get("message") or "Parse request failed"
-            if code == 209:
-                raise FirmMcpError("invalid_session", str(message))
-            raise FirmMcpError("invalid_config", str(message))
+            self._raise_parse(response)
         if not response.content:
             return {}
         return response.json()
@@ -86,7 +148,7 @@ class ParseClient:
             "contracts_Contactbook",
         }
         if class_name not in allowed:
-            raise FirmMcpError("invalid_config", "class is not allowed")
+            raise FirmMcpError("invalid_config", public_error("invalid_config"))
         query = {"where": json.dumps(where, separators=(",", ":"))}
         for key, value in params.items():
             if value is not None:
@@ -113,28 +175,61 @@ class ParseClient:
         payload = self._json(response)
         url = payload.get("url")
         if not isinstance(url, str) or not url:
-            raise FirmMcpError("invalid_config", "file upload did not return a URL")
+            raise FirmMcpError("invalid_config", public_error("invalid_config"))
         return url
 
-    def download_bytes(self, url: str) -> bytes:
-        self._url_ok(url)
+    def _binary_get(self, url: str) -> bytes:
+        self._validate_capability_url(url)
         try:
-            response = self._client.get(url)
+            with httpx.Client(
+                timeout=self.config.http_timeout_seconds,
+                transport=self._transport,
+                follow_redirects=False,
+                trust_env=False,
+                headers={},
+            ) as client:
+                response = client.get(url)
         except httpx.TimeoutException as exc:
-            raise FirmMcpError("send_timeout", "file download timed out") from exc
-        if response.status_code >= 400:
-            raise FirmMcpError("not_completed", "signed file could not be downloaded")
-        return response.content
+            raise FirmMcpError("not_completed", public_error("not_completed")) from exc
+        except httpx.HTTPError as exc:
+            raise FirmMcpError("not_completed", public_error("not_completed")) from exc
+        if response.status_code != 200:
+            raise FirmMcpError("not_completed", public_error("not_completed"))
+        blocked = {"location", "x-accel-redirect", "x-sendfile"}
+        if any(name.lower() in blocked for name in response.headers.keys()):
+            raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
+        data = response.content or b""
+        if len(data) > self.config.max_pdf_bytes:
+            raise FirmMcpError("too_large", public_error("too_large"))
+        if not data.startswith(b"%PDF-"):
+            raise FirmMcpError("not_pdf", public_error("not_pdf"))
+        parse_pages(data, max_pages=self.config.page_limit)
+        return data
+
+    def acquire_document_bytes(self, document_id: str, kind: str) -> bytes:
+        if kind not in {"source", "signed", "certificate"}:
+            raise FirmMcpError("invalid_config", public_error("invalid_config"))
+        result = self.cloud("lexysignFirmAcquireFile", {"documentId": document_id, "kind": kind})
+        if not isinstance(result, dict):
+            raise FirmMcpError("not_completed", public_error("not_completed"))
+        url = result.get("url")
+        if not isinstance(url, str) or not url:
+            raise FirmMcpError("not_completed", public_error("not_completed"))
+        return self._binary_get(url)
+
+    def download_bytes(self, url: str) -> bytes:
+        raise FirmMcpError("invalid_origin", public_error("invalid_origin"))
 
     def cloud(self, name: str, params: dict) -> Any:
         allowed = {
             "createdocumentfromapp",
             "savecontact",
             "lexysignFirmSendInvitations",
+            "lexysignFirmAcquireFile",
             "generatecertificate",
         }
         if name not in allowed:
-            raise FirmMcpError("invalid_config", "cloud function is not allowed")
+            raise FirmMcpError("invalid_config", public_error("invalid_config"))
         payload = self._json(self.request("POST", f"/functions/{name}", json=params))
         if isinstance(payload, dict) and "result" in payload:
             return payload["result"]

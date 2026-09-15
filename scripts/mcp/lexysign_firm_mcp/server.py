@@ -10,8 +10,9 @@ from mcp.server.mcpserver import MCPServer
 from . import TOOL_NAMES
 from .config import load_config
 from .errors import FirmMcpError
+from .jsonutil import strict_json_loads
 from .parse_client import ParseClient
-from .redact import public_text
+from .redact import public_error, public_text
 from . import service
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="lexysign-mcp %(levelname)s %(message)s")
@@ -34,7 +35,7 @@ def _ok(payload: dict[str, Any]) -> str:
 
 def _fail(exc: FirmMcpError) -> str:
     log.warning("tool_error %s", exc.code)
-    return public_text({"ok": False, "error": exc.code, "message": exc.detail})
+    return public_text({"ok": False, "error": exc.code, "message": public_error(exc.code)})
 
 
 @server.tool(name="firm_health", description="Authenticated LexySign identity and health for the configured firm principal.")
@@ -67,7 +68,7 @@ def create_draft(
     note: str = "",
 ) -> str:
     try:
-        signers = json.loads(signers_json)
+        signers = strict_json_loads(signers_json)
         if not isinstance(signers, list):
             raise FirmMcpError("bad_bounds", "signers_json must be a JSON list")
         return _ok(

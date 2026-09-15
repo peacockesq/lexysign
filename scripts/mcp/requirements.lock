@@ -1,3 +1,7 @@
+# Pinned third-party dependencies plus the local package.
+# Install from the repository root:
+#   python3 -m venv scripts/mcp/.venv
+#   scripts/mcp/.venv/bin/pip install -r scripts/mcp/requirements.lock
 annotated-types==0.8.0
 anyio==4.15.1
 attrs==26.1.0
@@ -14,7 +18,6 @@ idna==3.19
 iniconfig==2.3.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
--e git+https://github.com/peacockesq/lexysign.git@80ba54c6ba747789081c767f0798dca18d62c3a7#egg=lexysign_firm_mcp&subdirectory=../../../mcp-v1/scripts/mcp
 mcp==2.0.0
 mcp-types==2.0.0
 opentelemetry-api==1.44.0
@@ -29,9 +32,12 @@ pytest==8.3.5
 python-multipart==0.0.32
 referencing==0.37.0
 rpds-py==2026.6.3
+setuptools==69.5.1
 sse-starlette==3.4.11
 starlette==1.6.0
 truststore==0.10.4
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.53.0
+wheel==0.43.0
+./scripts/mcp

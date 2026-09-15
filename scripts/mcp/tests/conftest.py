@@ -33,7 +33,8 @@ def fake_parse():
 
 
 @pytest.fixture
-def harness(tmp_path, fake_parse):
+def harness(tmp_path, fake_parse, monkeypatch):
+    monkeypatch.setenv("LEXYSIGN_FIRM_APPROVAL_SECRET", "fictional-native-approval-secret")
     _server, base, store = fake_parse
     pdf_root = tmp_path / "pdfs"
     download = tmp_path / "out"

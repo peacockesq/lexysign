@@ -6,7 +6,8 @@ import { assertCanUseESignUnits, getTenantForExtUser } from '../../billing/entit
 async function sendMailProvider(req) {
   const app = appName;
   const extUserId = req.params?.extUserId || '';
-  if (extUserId) {
+  const firmQuotaAlreadyReserved = req.params?.firmQuotaAlreadyReserved === true;
+  if (extUserId && !firmQuotaAlreadyReserved) {
     const extUserQuery = new Parse.Query('contracts_Users');
     const extUser = await extUserQuery.get(extUserId, { useMasterKey: true });
     const tenant = await getTenantForExtUser(extUser);

@@ -81,7 +81,9 @@ class FakeParse:
                 "Name": "Client One",
                 "Email": "client@example.com",
                 "CreatedBy": pointer("_User", PRINCIPAL["user"]),
+                "TenantId": pointer("partners_Tenant", PRINCIPAL["tenant"]),
                 "IsDeleted": False,
+                "className": "contracts_Contactbook",
             }
         ]
         now = "2026-09-15T12:00:00.000Z"
@@ -155,6 +157,8 @@ class FakeParse:
         self.hang = False
         self.send_mode_force: str | None = None
         self.created = 0
+        self.reservations: dict[str, str] = {}
+        self.approval_ids: set[str] = set()
 
     def _doc(
         self,
@@ -176,11 +180,38 @@ class FakeParse:
                 "Email": "client@example.com",
                 "Name": "Client One",
                 "UserId": pointer("_User", "userSigner"),
+                "CreatedBy": pointer("_User", owner["user"]),
+                "TenantId": pointer("partners_Tenant", owner["tenant"]),
+                "IsDeleted": False,
+                "className": "contracts_Contactbook",
             }
         ]
         if extra_signers:
             signers.extend(extra_signers)
         url = f"__BASE__/files/seed.pdf"
+        placeholders = [
+            {
+                "Id": "s1",
+                "Role": "client",
+                "signerObjId": "contact-1",
+                "signerPtr": pointer("contracts_Contactbook", "contact-1"),
+                "placeHolder": [
+                    {
+                        "pageNumber": 1,
+                        "pos": [
+                            {
+                                "type": "signature",
+                                "key": 1,
+                                "xPosition": 72,
+                                "yPosition": 100,
+                                "Width": 180,
+                                "Height": 38,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
         return {
             "objectId": object_id,
             "Name": name,
@@ -195,7 +226,7 @@ class FakeParse:
                 "TenantId": {"objectId": owner["tenant"], "__type": "Pointer", "className": "partners_Tenant"},
             },
             "Signers": signers,
-            "Placeholders": [],
+            "Placeholders": placeholders,
             "IsCompleted": completed,
             "IsDeclined": declined,
             "IsArchive": False,
@@ -263,6 +294,10 @@ class FakeParseHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/files/"):
+            query = parse_qs(parsed.query)
+            if not query.get("token"):
+                self._send(400, {"message": "unauthorized"})
+                return
             name = path.rsplit("/", 1)[-1]
             data = self.store.files.get(name)
             if data is None:
@@ -346,6 +381,10 @@ class FakeParseHandler(BaseHTTPRequestHandler):
                     continue
                 if where.get("CreatedBy") and pid(item.get("CreatedBy")) != pid(where.get("CreatedBy")):
                     continue
+                if where.get("TenantId") and pid(item.get("TenantId")) != pid(where.get("TenantId")):
+                    continue
+                if item.get("IsDeleted") is True:
+                    continue
                 results.append(item)
             self._send(200, {"results": results})
             return
@@ -386,9 +425,16 @@ class FakeParseHandler(BaseHTTPRequestHandler):
                         "objectId": pid(item) or "contact-1",
                         "Email": "client@example.com",
                         "Name": "Client One",
+                        "CreatedBy": pointer("_User", PRINCIPAL["user"]),
+                        "TenantId": pointer("partners_Tenant", PRINCIPAL["tenant"]),
+                        "IsDeleted": False,
+                        "className": "contracts_Contactbook",
                     }
                     for item in (doc.get("Signers") or [pointer("contracts_Contactbook", "contact-1")])
                 ],
+                "Placeholders": doc.get("Placeholders") or [],
+                "SendinOrder": bool(doc.get("SendinOrder")),
+                "TimeToCompleteDays": int(doc.get("TimeToCompleteDays") or 15),
                 "IsCompleted": False,
                 "IsDeclined": False,
                 "IsArchive": False,
@@ -408,7 +454,9 @@ class FakeParseHandler(BaseHTTPRequestHandler):
                 "Name": params.get("name"),
                 "Email": email,
                 "CreatedBy": pointer("_User", user["objectId"]),
+                "TenantId": pointer("partners_Tenant", params.get("tenantId") or PRINCIPAL["tenant"]),
                 "IsDeleted": False,
+                "className": "contracts_Contactbook",
             }
             self.store.contacts.append(item)
             self._send(200, {"result": item})
@@ -423,12 +471,52 @@ class FakeParseHandler(BaseHTTPRequestHandler):
             doc["CertificateUrl"] = url
             self._send(200, {"result": {"CertificateUrl": url}})
             return
+        if name == "lexysignFirmAcquireFile":
+            self._acquire_file(params, user)
+            return
         if name == "lexysignFirmSendInvitations":
             self._send_invitations(params, user)
             return
         self._send(404, {"code": 141, "error": f"Invalid function: {name}"})
 
+    def _capability(self, url: str) -> str:
+        clean = str(url or "").split("?")[0]
+        return f"{clean}?token=firm-file-token"
+
+    def _acquire_file(self, params: dict, user: dict) -> None:
+        document_id = params.get("documentId")
+        kind = params.get("kind")
+        doc = self.store.documents.get(document_id)
+        if user["objectId"] != PRINCIPAL["user"]:
+            self._send(403, {"code": 119, "error": "foreign_document: not owned"})
+            return
+        if not doc:
+            self._send(400, {"code": 102, "error": "missing: not found"})
+            return
+        if pid(doc.get("CreatedBy")) != PRINCIPAL["user"] or pid(doc.get("ExtUserPtr")) != PRINCIPAL["ext"]:
+            self._send(403, {"code": 119, "error": "foreign_document: not owned"})
+            return
+        stored = ""
+        if kind == "source":
+            stored = doc.get("URL") or ""
+        elif kind == "signed":
+            stored = doc.get("SignedUrl") or (doc.get("URL") if doc.get("IsCompleted") else "")
+        elif kind == "certificate":
+            stored = doc.get("CertificateUrl") or ""
+        else:
+            self._send(400, {"code": 102, "error": "invalid_parameter: kind"})
+            return
+        if not stored:
+            self._send(400, {"code": 102, "error": "missing_url: requested document file is missing."})
+            return
+        self._send(200, {"result": {"url": self._capability(stored), "kind": kind, "source": "document"}})
+
     def _send_invitations(self, params: dict, user: dict) -> None:
+        import hashlib
+        import hmac
+        import json
+        import os
+
         document_id = params.get("documentId")
         if document_id == "doc-hang" or self.store.hang:
             time.sleep(2.5)
@@ -450,36 +538,118 @@ class FakeParseHandler(BaseHTTPRequestHandler):
         if iso and iso.startswith("2020"):
             self._send(400, {"code": 102, "error": "document_expired: expired"})
             return
-        expected = params.get("expected") or {}
-        if expected.get("title") and expected["title"] != doc.get("Name"):
+        expected = params.get("expected")
+        approval = params.get("approval") or {}
+        required = [
+            "title",
+            "fileUrl",
+            "fileHash",
+            "recipients",
+            "order",
+            "expiry",
+            "timeToCompleteDays",
+            "subject",
+            "sendMode",
+            "placeholders",
+        ]
+        if not isinstance(expected, dict) or any(expected.get(key) in (None, "") for key in required):
+            self._send(400, {"code": 102, "error": "approval_missing: Canonical expected binding is required."})
+            return
+        secret = os.environ.get("LEXYSIGN_FIRM_APPROVAL_SECRET", "")
+        if not secret:
+            self._send(403, {"code": 119, "error": "approval_unconfigured: Native firm approval secret is not configured."})
+            return
+        if not approval.get("approval_id") or not approval.get("hmac"):
+            self._send(400, {"code": 102, "error": "approval_missing: Server-verifiable approval is required."})
+            return
+        payload = {
+            "approval_id": approval.get("approval_id"),
+            "document_id": document_id,
+            "expires_at": int(approval.get("expires_at") or 0),
+            "issued_at": int(approval.get("issued_at") or 0),
+            "manifest_hash": approval.get("manifest_hash") or "",
+            "operator": approval.get("operator") or "",
+            "expected": expected,
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+        want = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(approval.get("hmac")), want):
+            self._send(400, {"code": 102, "error": "approval_mismatch: Approval signature is invalid."})
+            return
+        if int(approval.get("expires_at") or 0) < int(time.time()):
+            self._send(400, {"code": 102, "error": "approval_expired: Operator approval has expired."})
+            return
+        if expected.get("title") != doc.get("Name") or expected.get("fileUrl") != doc.get("URL"):
             self._send(400, {"code": 102, "error": "payload_modified: title"})
             return
-        if expected.get("fileUrl") and expected["fileUrl"] != doc.get("URL"):
-            self._send(400, {"code": 102, "error": "payload_modified: file"})
+        order = "sequential" if doc.get("SendinOrder") else "parallel"
+        if expected.get("order") != order:
+            self._send(400, {"code": 102, "error": "payload_modified: order"})
             return
-        if doc.get("SignedUrl") and doc.get("SignedUrl") != doc.get("URL"):
+        if int(expected.get("timeToCompleteDays") or 0) != int(doc.get("TimeToCompleteDays") or 15):
+            self._send(400, {"code": 102, "error": "payload_modified: days"})
+            return
+        if str(expected.get("expiry") or "") != str(iso or ""):
+            self._send(400, {"code": 102, "error": "payload_modified: expiry"})
+            return
+        want_emails = [str(item.get("email") or "").lower() for item in (expected.get("recipients") or [])]
+        actual_emails = [str(item.get("Email") or "").lower() for item in (doc.get("Signers") or [])]
+        want_ids = [str(item.get("contact_id") or "") for item in (expected.get("recipients") or [])]
+        actual_ids = [str(item.get("objectId") or "") for item in (doc.get("Signers") or [])]
+        if want_emails != actual_emails or want_ids != actual_ids:
+            self._send(400, {"code": 102, "error": "payload_modified: recipients"})
+            return
+        if not (doc.get("Placeholders") or []):
+            self._send(400, {"code": 102, "error": "payload_modified: empty fields"})
+            return
+        for signer in doc.get("Signers") or []:
+            if pid(signer.get("CreatedBy")) and pid(signer.get("CreatedBy")) != PRINCIPAL["user"]:
+                self._send(403, {"code": 119, "error": "foreign_contact: Signer contact is not owned by the configured principal."})
+                return
+            if pid(signer.get("TenantId")) and pid(signer.get("TenantId")) != PRINCIPAL["tenant"]:
+                self._send(403, {"code": 119, "error": "foreign_contact: Signer contact tenant does not match the configured tenant."})
+                return
+        if doc.get("SignedUrl") or doc.get("SentToOthers") is True:
             self._send(400, {"code": 137, "error": "duplicate_send: already sent"})
             return
+        if document_id in self.store.reservations or approval.get("approval_id") in self.store.approval_ids:
+            self._send(400, {"code": 137, "error": "duplicate_send: document send is already reserved."})
+            return
+        self.store.reservations[document_id] = "in_flight"
+        self.store.approval_ids.add(str(approval.get("approval_id")))
         if self.store.send_mode_force == "uncertain":
+            self.store.reservations[document_id] = "uncertain"
             self._send(200, {"result": {"status": "uncertain", "smtp_accepted": False, "delivered": False, "recipients": []}})
             return
-        send_mode = params.get("sendMode") or "email"
+        send_mode = expected.get("sendMode") or "email"
         if not doc.get("SignedUrl"):
             doc["SignedUrl"] = doc.get("URL")
             doc["SentToOthers"] = True
-        recipients = [{"email": "client@example.com", "smtp_accepted": send_mode != "manual", "delivery": "accepted_not_delivered" if send_mode != "manual" else "not_attempted_manual"}]
-        status = "activated_manual" if send_mode == "manual" else "sent_smtp_accepted"
-        self._send(
-            200,
+        recipients = [
             {
-                "result": {
-                    "status": status,
-                    "smtp_accepted": send_mode != "manual",
-                    "delivered": False,
-                    "recipients": recipients,
+                "email": "client@example.com",
+                "smtp_accepted": send_mode != "manual",
+                "delivery": "accepted_not_delivered" if send_mode != "manual" else "not_attempted_manual",
+            }
+        ]
+        status = "activated_manual" if send_mode == "manual" else "sent_smtp_accepted"
+        result = {
+            "status": status,
+            "smtp_accepted": send_mode != "manual",
+            "delivered": False,
+            "recipients": recipients,
+        }
+        if send_mode == "manual":
+            host = self.headers.get("Host")
+            result["manual_artifacts"] = [
+                {
+                    "email": "client@example.com",
+                    "contact_id": "contact-1",
+                    "signing_url": f"https://sign.lexyalgo.com/login/c3ludGhldGlj",
                 }
-            },
-        )
+            ]
+        self.store.reservations[document_id] = status
+        self._send(200, {"result": result})
 
 
 def _where_match(doc: dict, where: dict) -> bool:

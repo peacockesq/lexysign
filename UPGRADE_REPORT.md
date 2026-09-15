@@ -11,7 +11,7 @@ Status at end of coding worker: local merge commit only. No push, PR, deploy, or
 - Upstream tag SHA: `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`
 - Actual git merge-base(`HEAD`, `v2.41.3`) before merge: `b9a309fa36a17c1b8678d12b940de0d36c032935` (`Merge pull request #2143 from OpenSignLabs/staging`)
 - Task-stated merge-base: `197c00dd79f8ceded909c2edb4560355fb0f8e07` (`Merge pull request #2142`). That commit is a first-parent ancestor of `b9a309fa`; git's merge-base with the fetched tag is `b9a309fa`. The merge used the real merge-base.
-- Ending SHA: `4393ae23ab67d4af15dde3c0909d4a678504f825` (merge commit; parents `d4212d402325551cb9cb903038adfab76afe7b89` and `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`)
+- Ending SHA: see “Staging merge and CI follow-up” below. Upstream merge commit remains `4393ae23ab67d4af15dde3c0909d4a678504f825` (parents `d4212d402325551cb9cb903038adfab76afe7b89` and `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`).
 
 Do not treat `apps/OpenSign/package.json` / `apps/OpenSignServer/package.json` `version: 2.37.0` as provenance. Upstream tag `v2.41.3` itself still carries that stale metadata. `apps/OpenSign/public/version.txt` was updated by upstream.
 
@@ -98,24 +98,51 @@ Covers billing helpers (`getPeriodKey`, `subscriptionIsActive`, monthly limit 10
 # duration_ms 875.591695
 ```
 
-4. `cd apps/OpenSign && node --test src/auth/supabaseAuth.node.test.js`
+4. Client node:test files originally lived under `src/**/*.node.test.js` (Vitest default discovery). They were moved to `apps/OpenSign/test-node/*.test.mjs` in the follow-up; receipts below are the original runs.
 
-```
-# tests 3
-# suites 1
-# pass 3
-# fail 0
-# duration_ms 624.454937
-```
+Also added Vitest files (`src/auth/supabaseAuth.test.js`, `src/constant/lexysignContracts.test.js`) for GitHub CI `apps/OpenSign` `npm test` (`vitest run`). They were not executed on this shared ARM host (no full client `npm install`). CI now runs them; treat local Vitest as pending until that GitHub job.
 
-Also added Vitest files (`src/auth/supabaseAuth.test.js`, `src/constant/lexysignContracts.test.js`) for parent/VPS `apps/OpenSign` `npm test` (`vitest run`). They were not executed here: full client `npm install` was not run on this shared ARM host.
-
-Not run (not called passed):
+Not run locally (not called passed):
+- `apps/OpenSign` Vitest (`npm test`).
 - `apps/OpenSignServer` jasmine/`mongodb-runner` integration (`npm test` starts Mongo).
 - Vite production build (`NODE_OPTIONS=--max-old-space-size=8192`).
 - Docker image builds / compose / browser smoke.
 
 `git diff --check`: clean.
+
+## Staging merge and CI follow-up
+
+Merge-base of production-main/tag work remains `b9a309fa36a17c1b8678d12b940de0d36c032935`.
+Merge-base with `origin/staging` before the staging merge: `637cd865c4e30671e86e9da12538540dad424be4`.
+
+`origin/staging` `22ea252f555df04e299e423b63653d97ffb48341` was merged into this branch as `c38469ea493392f45daeb8d3eb9b0fc5667d3980` (parents `aa40aba673441eef68236f43153742c9cd2cd174` and `22ea252f555df04e299e423b63653d97ffb48341`). After that merge, `origin/staging`, `origin/main`, and tag `v2.41.3` are all ancestors.
+
+Staging unique files vs that merge-base were only:
+- `.github/workflows/lexysign-deploy.yml` — quote-style path globs; production-only Caddy copy/reload; connect `$NETWORK_NAME` plus `${UTS_INGESTION_NETWORK:-infra_default}`. Older than production-main: no deploy timeouts, no edge compose profile, still baked `VITE_SUPABASE_*` build-args, skipped staging Caddy reload entirely.
+- `deploy/lexysign/Caddyfile` — added `uts-api.peacockesq.com`. Production-main already has that route plus doc-v2 and Apiary Foundry.
+
+Conflicts (2). Targeted keep-main, not blanket `--ours`:
+- Kept production-main `.github/workflows/lexysign-deploy.yml` (runtime-env, 35m timeout, sequential image pulls with timeout, `COMPOSE_PROFILES=edge`, extra Caddy networks including docassemble-lexy-v2). Another worker owns further deploy-workflow/release-helper fixes; this file is the main equivalent after resolution.
+- Kept production-main `deploy/lexysign/Caddyfile` (uts-api + doc-v2 + Apiary). Staging uts-api is a subset.
+
+Preserved production-main Docker runtime-env loader (`apps/OpenSign/docker-entrypoint.lexysign.sh`, `index.html` `runtime-env.js`, `Dockerfile.lexysign` ENTRYPOINT) and `deploy/lexysign/docker-compose.runtime.yml` — staging did not touch those files.
+
+### Test runner segregation
+
+- Node contract tests: `apps/OpenSign/test-node/*.test.mjs` (`npm run test:node`) and `apps/OpenSignServer/spec/lexysignContracts.test.js` (`npm run test:node`). Jasmine still only loads `spec/**/*[sS]pec.js`, so server node:test files are not Jasmine specs.
+- Vitest: `apps/OpenSign/src/**/*.{test,spec}.{js,jsx,ts,tsx}` with exclude of `**/*.node.test.js` and `test-node/**`. Remaining Vitest suites: `src/auth/supabaseAuth.test.js`, `src/constant/lexysignContracts.test.js`.
+- Local re-run after the move: client `node --test test-node/*.test.mjs` 8 pass; server `node --test spec/lexysignContracts.test.js` 11 pass.
+- Local Vitest: pending (no client npm install on ARM). GitHub CI job `client-tests` runs `npm ci` + `npm run test:node` + `npm test`.
+- Server Jasmine/`mongodb-runner`: still pending (needs Mongo). Not added to this CI.
+
+### CI (`.github/workflows/lexysign-ci.yml` only)
+
+- `static-checks`: fetch-depth 0; syntax checks; secret scan fail-closed (base SHA must exist; `git diff` failure exits 1; deleted paths skipped via `--diff-filter=ACMRT` plus missing-file continue; match reports filename only, not the secret line).
+- `server-node-tests`: Node 22, `npm ci --omit=dev`, `npm run test:node`.
+- `client-tests`: Node 22, `npm ci`, node contract tests, Vitest.
+- `docker-build`: unchanged intent, still no push.
+
+Deploy workflow was not edited in this follow-up except the keep-main conflict resolution.
 
 ## Dependency / security notes
 
@@ -124,16 +151,18 @@ Not run (not called passed):
 - First full `npm install` in `apps/OpenSignServer` was killed on timeout; `node_modules/` is local/untracked. Do not treat that tree as a verified production install.
 - New Parse migrations under `apps/OpenSignServer/databases/migrations/` must be applied by the parent deploy path, not this worker.
 
-## Remaining risks
+## Remaining risks (updated)
 
 - Runtime behavior of parse-server 8.6.x, mailer majors, and workflow/`createdocumentfromapp` is untested in Docker/browser.
-- `isViewerSigner` is an OSS stub (`false`). If EE-only viewer logic is later enabled, re-check the mobile header buttons.
-- `sendSystemMail` does not consume e-sign units (only `sendMailv3` does). That matches “system notification vs request mail” but should be confirmed if decline mail should count.
+- `isViewerSigner` is an OSS stub (`false`).
+- `sendSystemMail` does not consume e-sign units (only `sendMailv3` does).
 - Certificate PDF now also requires `./images/na_sign.png` at process cwd.
-- Parent still owns shared proxy/Caddy safety, production/staging restarts, and DB/client records.
+- GitHub CI Vitest / docker-build / secret-scan jobs are pending until parent pushes. Local ARM did not run client `npm ci` or image builds.
+- Server Jasmine still pending (Mongo).
+- Parent still owns shared proxy/Caddy safety, production/staging restarts, DB/client records, and watching PR/CI.
 
 ## Verdict
 
 READY_FOR_PARENT_TEST
 
-Local merge is a true two-parent reconciliation of `v2.41.3` into customized LexySign. Custom contracts were re-checked after auto-merge. Executable receipts above are limited to syntax + node:test contract tests on aarch64. Cain should run Docker/browser/jasmine/vitest on VPS before any deploy.
+True upstream merge plus staging history are on this branch. Staging ancestry is `22ea252f5`. Custom contracts re-checked after the staging merge. Parent should fast-forward the integration branch and watch GitHub CI (node tests, Vitest, docker-build, fail-closed secret scan). No local push.

@@ -27,11 +27,13 @@
 //   - Historical/unknown terminal documents without this tab's receipt stay rejected.
 //
 // Same-tab draft write ordering (not a cross-tab outbox):
-//   Autosave and Next share a per-documentId in-memory queue. Each write takes a
-//   generation token before upload. PUT/save is serialized on that document.
-//   A later Next invalidates older autosaves so a held upload cannot overwrite
-//   a newer successful Next. Already-started PUTs finish, then the newer write
-//   runs. Failures do not deadlock the queue. This is not cross-tab exactly-once.
+//   Autosave and Next share a per-documentId in-memory queue. Four identities
+//   are distinct: source snapshot (sourceKey), attempted generation, durable
+//   success, and current Next UI attempt. PUT/save is serialized. A failed
+//   newer attempt does not drop a pending save of the same latest source. An
+//   older source cannot overwrite a newer durable success. Obsolete Next must
+//   not publish UI after a newer Next begins. Already-started PUTs finish;
+//   failures do not deadlock. This is not cross-tab exactly-once.
 
 export function assertActiveSession({ tenantId, sessionToken } = {}) {
   if (!tenantId || !sessionToken) {
@@ -112,8 +114,13 @@ function parseOffsetMinutes(offset) {
   if (offset === "Z") return 0;
   const match = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
   if (!match) return Number.NaN;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3]);
+  // Component bounds only. +99:99 / +00:99 are not native Date/ISO-Z producer
+  // outputs and are not claimed as a persisted-store bypass.
+  if (hours > 23 || minutes > 59) return Number.NaN;
   const sign = match[1] === "-" ? -1 : 1;
-  return sign * (Number(match[2]) * 60 + Number(match[3]));
+  return sign * (hours * 60 + minutes);
 }
 
 export function parsePersistedExpiryMs(persisted) {
@@ -264,7 +271,10 @@ function draftPersistenceState(documentId) {
   if (!state) {
     state = {
       generation: 0,
-      nextGeneration: 0,
+      latestSourceKey: null,
+      durableGeneration: 0,
+      durableSourceKey: null,
+      uiAttempt: 0,
       putChain: Promise.resolve()
     };
     draftPersistence.set(id, state);
@@ -281,19 +291,34 @@ function enqueueDraftPut(state, task) {
   return run;
 }
 
-export function beginDraftPersistenceWrite({ documentId, kind } = {}) {
+function sourceIdentity(sourceKey, generation) {
+  if (sourceKey == null || sourceKey === "") {
+    return `attempt:${generation}`;
+  }
+  return String(sourceKey);
+}
+
+export function beginDraftPersistenceWrite({ documentId, kind, sourceKey } = {}) {
   const state = draftPersistenceState(documentId);
+  const resolvedKind = kind === "next" ? "next" : "autosave";
   if (!state) {
-    return { documentId: "", generation: 0, kind: kind === "next" ? "next" : "autosave" };
+    return {
+      documentId: "",
+      generation: 0,
+      kind: resolvedKind,
+      sourceKey: ""
+    };
   }
   state.generation += 1;
   const token = {
     documentId: String(documentId),
     generation: state.generation,
-    kind: kind === "next" ? "next" : "autosave"
+    kind: resolvedKind,
+    sourceKey: sourceIdentity(sourceKey, state.generation)
   };
+  state.latestSourceKey = token.sourceKey;
   if (token.kind === "next") {
-    state.nextGeneration = token.generation;
+    state.uiAttempt = token.generation;
   }
   return token;
 }
@@ -302,27 +327,37 @@ export function isDraftPersistenceWriteCurrent(token) {
   if (!token?.documentId) return false;
   const state = draftPersistence.get(String(token.documentId));
   if (!state) return false;
-  if (token.kind === "next") {
-    return token.generation === state.nextGeneration;
-  }
-  if (state.nextGeneration > token.generation) return false;
-  return token.generation === state.generation;
+  return token.sourceKey === state.latestSourceKey;
+}
+
+export function isDraftPersistenceUiCurrent(token) {
+  if (!token?.documentId) return false;
+  const state = draftPersistence.get(String(token.documentId));
+  if (!state) return false;
+  if (token.kind !== "next") return false;
+  return token.generation === state.uiAttempt;
 }
 
 export async function commitDraftPersistenceWrite(token, writeFn) {
   if (!token?.documentId) {
-    return { skipped: true, reason: "missing-document" };
+    return { skipped: true, reason: "missing-document", publishable: false };
   }
   const state = draftPersistence.get(String(token.documentId));
   if (!state) {
-    return { skipped: true, reason: "missing-state" };
+    return { skipped: true, reason: "missing-state", publishable: false };
   }
   return enqueueDraftPut(state, async () => {
     if (!isDraftPersistenceWriteCurrent(token)) {
-      return { skipped: true, reason: "stale" };
+      return { skipped: true, reason: "stale", publishable: false };
     }
     const value = await writeFn();
-    return { skipped: false, value };
+    state.durableGeneration = token.generation;
+    state.durableSourceKey = token.sourceKey;
+    return {
+      skipped: false,
+      value,
+      publishable: isDraftPersistenceUiCurrent(token)
+    };
   });
 }
 

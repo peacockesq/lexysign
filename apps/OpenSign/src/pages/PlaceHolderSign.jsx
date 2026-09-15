@@ -74,6 +74,7 @@ import {
   commitDraftPersistenceWrite,
   editableSourceUrl,
   evaluateFinalizeGuard,
+  isDraftPersistenceUiCurrent,
   isDraftPersistenceWriteCurrent,
   shouldExposeSignerShareLinks
 } from "../utils/draftDocumentPreparation";
@@ -1048,7 +1049,8 @@ function PlaceHolderSign() {
   const autosavedetails = async () => {
     const draftWrite = beginDraftPersistenceWrite({
       documentId,
-      kind: "autosave"
+      kind: "autosave",
+      sourceKey: pdfBase64Url
     });
     const signers = signersdata?.reduce((acc, x) => {
       if (x.objectId) {
@@ -1108,7 +1110,8 @@ function PlaceHolderSign() {
     }
     const draftWrite = beginDraftPersistenceWrite({
       documentId,
-      kind: "next"
+      kind: "next",
+      sourceKey: pdfBase64Url
     });
     try {
       let cleanSourceUrl;
@@ -1121,14 +1124,23 @@ function PlaceHolderSign() {
             "",
           );
         } catch (e) {
+          if (!isDraftPersistenceUiCurrent(draftWrite)) {
+            return;
+          }
           console.log("error", e);
           alert(t("something-went-wrong-mssg"));
           return;
         }
         if (!cleanSourceUrl) {
+          if (!isDraftPersistenceUiCurrent(draftWrite)) {
+            return;
+          }
           alert(t("something-went-wrong-mssg"));
           return;
         }
+      }
+      if (!isDraftPersistenceUiCurrent(draftWrite)) {
+        return;
       }
       const pdfUrl = await embedPrefilllWidgets();
       if (pdfUrl) {
@@ -1143,7 +1155,6 @@ function PlaceHolderSign() {
           };
         });
         const currentUser = signersdata.find((x) => x.Email === currentId);
-        setCurrentId(currentUser?.objectId);
         try {
           const data = buildDraftSavePayload({
             name: docTitle || pdfDetails?.[0]?.Name,
@@ -1170,10 +1181,14 @@ function PlaceHolderSign() {
               return data;
             }
           );
+          if (!isDraftPersistenceUiCurrent(draftWrite)) {
+            return;
+          }
           if (!committed || committed.skipped) {
             alert(t("something-went-wrong-mssg"));
             return;
           }
+          setCurrentId(currentUser?.objectId);
           setPdfDetails(applyDraftFieldsToPdfDetails(pdfDetails, data));
           setIsLoading({ isLoad: false });
           setIsSendAlert({ mssg: "confirm", alert: true });
@@ -1193,12 +1208,17 @@ function PlaceHolderSign() {
             setIsMailModal(true);
           }
         } catch (e) {
+          if (!isDraftPersistenceUiCurrent(draftWrite)) {
+            return;
+          }
           console.log("error", e);
           alert(t("something-went-wrong-mssg"));
         }
       }
     } finally {
-      setIsUiLoading(false);
+      if (isDraftPersistenceUiCurrent(draftWrite)) {
+        setIsUiLoading(false);
+      }
     }
   });
 

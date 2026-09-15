@@ -12,6 +12,7 @@ import {
   buildFinalizePayload,
   commitDraftPersistenceWrite,
   evaluateFinalizeGuard,
+  isDraftPersistenceUiCurrent,
   isDraftPersistenceWriteCurrent,
   shouldExposeSignerShareLinks
 } from "../../../apps/OpenSign/src/utils/draftDocumentPreparation.js";
@@ -93,6 +94,7 @@ export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdf
       applyDraftFieldsToPdfDetails,
       beginDraftPersistenceWrite,
       commitDraftPersistenceWrite,
+      isDraftPersistenceUiCurrent,
       isDraftPersistenceWriteCurrent,
       setIsUiLoading: (v) => {
         state.isUiLoading = v;

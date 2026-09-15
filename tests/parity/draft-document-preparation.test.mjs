@@ -10,6 +10,7 @@ import {
   commitDraftPersistenceWrite,
   editableSourceUrl,
   evaluateFinalizeGuard,
+  isDraftPersistenceUiCurrent,
   isDraftPersistenceWriteCurrent,
   isDraftSavePayload,
   isPersistedInvitationExpired,
@@ -272,6 +273,10 @@ describe("draft document preparation helper", () => {
       Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso: "2026-09-15T12:00:00.000+00:00" } })),
       true
     );
+    assert.equal(
+      Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso: "2026-09-15T12:00:00.000+05:30" } })),
+      true
+    );
     for (const iso of [
       4070908800000,
       ["2099-01-01T00:00:00.000Z"],
@@ -280,7 +285,9 @@ describe("draft document preparation helper", () => {
       {},
       [],
       "not-a-date",
-      "   "
+      "   ",
+      "2099-01-01T00:00:00+99:99",
+      "2099-01-01T00:00:00+00:99"
     ]) {
       assert.equal(Number.isFinite(parsePersistedExpiryMs({ ExpiryDate: { iso, __type: "Date" } })), false);
       assert.equal(isPersistedInvitationExpired({ ExpiryDate: { iso, __type: "Date" } }, now), true);
@@ -351,5 +358,145 @@ describe("draft document preparation helper", () => {
     const other = beginDraftPersistenceWrite({ documentId: "persist-doc-c", kind: "autosave" });
     assert.equal(isDraftPersistenceWriteCurrent(other), true);
     assert.equal(isDraftPersistenceWriteCurrent(retry), true);
+  });
+
+  it("failed newer attempt of the same source does not drop a pending save", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-same-source";
+    const auto = beginDraftPersistenceWrite({
+      documentId,
+      kind: "autosave",
+      sourceKey: "snap-180"
+    });
+    const next = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-180"
+    });
+    assert.equal(isDraftPersistenceWriteCurrent(auto), true);
+    assert.equal(isDraftPersistenceUiCurrent(auto), false);
+    assert.equal(isDraftPersistenceUiCurrent(next), true);
+    await assert.rejects(
+      commitDraftPersistenceWrite(next, async () => {
+        throw new Error("synthetic next put failure");
+      }),
+      /synthetic next put failure/
+    );
+    assert.equal(isDraftPersistenceWriteCurrent(auto), true);
+    const saved = await commitDraftPersistenceWrite(auto, async () => "auto-180");
+    assert.equal(saved.skipped, false);
+    assert.equal(saved.value, "auto-180");
+    const retry = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-180"
+    });
+    const recovered = await commitDraftPersistenceWrite(retry, async () => "retry-180");
+    assert.equal(recovered.skipped, false);
+    assert.equal(recovered.publishable, true);
+  });
+
+  it("older different snapshot vs failed new attempt is not a current success", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-diff-source";
+    const auto = beginDraftPersistenceWrite({
+      documentId,
+      kind: "autosave",
+      sourceKey: "snap-90"
+    });
+    const next = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-180"
+    });
+    assert.equal(isDraftPersistenceWriteCurrent(auto), false);
+    assert.equal(isDraftPersistenceUiCurrent(next), true);
+    await assert.rejects(
+      commitDraftPersistenceWrite(next, async () => {
+        throw new Error("synthetic next upload failure");
+      }),
+      /synthetic next upload failure/
+    );
+    const autoResult = await commitDraftPersistenceWrite(auto, async () => {
+      throw new Error("stale 90 must not persist as current 180");
+    });
+    assert.equal(autoResult.skipped, true);
+    assert.equal(isDraftPersistenceUiCurrent(next), true);
+    assert.equal(autoResult.publishable, false);
+  });
+
+  it("two same-snapshot autosaves keep the earlier save when the later upload fails", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-two-auto";
+    const first = beginDraftPersistenceWrite({
+      documentId,
+      kind: "autosave",
+      sourceKey: "snap-180"
+    });
+    const second = beginDraftPersistenceWrite({
+      documentId,
+      kind: "autosave",
+      sourceKey: "snap-180"
+    });
+    assert.equal(isDraftPersistenceWriteCurrent(first), true);
+    await assert.rejects(
+      commitDraftPersistenceWrite(second, async () => {
+        throw new Error("synthetic later autosave failure");
+      }),
+      /synthetic later autosave failure/
+    );
+    const firstResult = await commitDraftPersistenceWrite(first, async () => "first-180");
+    assert.equal(firstResult.skipped, false);
+    assert.equal(firstResult.value, "first-180");
+  });
+
+  it("post-write UI recheck suppresses an obsolete Next after a newer attempt begins", async () => {
+    resetDraftPersistenceState();
+    const documentId = "persist-ui-postwrite";
+    let releaseOldPut;
+    const oldHeld = new Promise((resolve) => {
+      releaseOldPut = resolve;
+    });
+    let oldEntered;
+    const oldSeen = new Promise((resolve) => {
+      oldEntered = resolve;
+    });
+    const oldNext = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-90"
+    });
+    const oldCommit = commitDraftPersistenceWrite(oldNext, async () => {
+      oldEntered();
+      await oldHeld;
+      return "old-90";
+    });
+    await oldSeen;
+    const newNext = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-180"
+    });
+    assert.equal(isDraftPersistenceUiCurrent(oldNext), false);
+    assert.equal(isDraftPersistenceUiCurrent(newNext), true);
+    releaseOldPut();
+    const oldResult = await oldCommit;
+    assert.equal(oldResult.skipped, false);
+    assert.equal(oldResult.publishable, false);
+    await assert.rejects(
+      commitDraftPersistenceWrite(newNext, async () => {
+        throw new Error("synthetic newer upload failure");
+      }),
+      /synthetic newer upload failure/
+    );
+    assert.equal(isDraftPersistenceUiCurrent(oldNext), false);
+    const retry = beginDraftPersistenceWrite({
+      documentId,
+      kind: "next",
+      sourceKey: "snap-180"
+    });
+    const recovered = await commitDraftPersistenceWrite(retry, async () => "retry-180");
+    assert.equal(recovered.skipped, false);
+    assert.equal(recovered.publishable, true);
   });
 });

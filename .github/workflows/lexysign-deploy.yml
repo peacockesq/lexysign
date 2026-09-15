@@ -17,7 +17,7 @@ on:
         options: [staging, production]
         default: staging
       image_tag:
-        description: Optional image tag override; defaults to staging/prod SHA tag
+        description: Optional; if set must match the pinned prod-/staging-<sha12> tag. Arbitrary overrides are rejected.
         required: false
         type: string
 
@@ -76,12 +76,14 @@ jobs:
             MONGO_CONTAINER="lexysign-staging-mongo"
             NETWORK_NAME="lexysign-staging_lexysign"
           fi
-          TAG="${{ github.event.inputs.image_tag }}"
-          if [[ -z "$TAG" ]]; then
-            TAG="${PREFIX}-${GITHUB_SHA::12}"
+          PINNED="${PREFIX}-${GITHUB_SHA::12}"
+          OVERRIDE="${{ github.event.inputs.image_tag }}"
+          if [[ -n "$OVERRIDE" && "$OVERRIDE" != "$PINNED" && "$OVERRIDE" != "$GITHUB_SHA" && "$OVERRIDE" != "${GITHUB_SHA::12}" ]]; then
+            echo "Refusing mismatched image_tag override '$OVERRIDE'. Deployed selection is pinned to workflow SHA tag $PINNED." >&2
+            exit 1
           fi
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$PINNED" >> "$GITHUB_OUTPUT"
           echo "public_url=$PUBLIC_URL" >> "$GITHUB_OUTPUT"
           echo "project_name=$PROJECT_NAME" >> "$GITHUB_OUTPUT"
           echo "deploy_path=$DEPLOY_PATH" >> "$GITHUB_OUTPUT"
@@ -135,6 +137,11 @@ jobs:
     environment: ${{ needs.select-environment.outputs.target }}
     steps:
       - uses: actions/checkout@v4
+      - name: App-release safety tests
+        shell: bash
+        run: |
+          python3 -m pip install --disable-pip-version-check -q pyyaml
+          bash deploy/lexysign/tests/run-tests.sh
       - name: Install SSH key
         shell: bash
         run: |
@@ -142,66 +149,24 @@ jobs:
           printf '%s\n' "${{ secrets.LEXYSIGN_DEPLOY_SSH_KEY }}" > ~/.ssh/lexysign_deploy_key
           chmod 600 ~/.ssh/lexysign_deploy_key
           ssh-keyscan -T 30 -p "${{ vars.LEXYSIGN_DEPLOY_PORT || '22' }}" "${{ vars.LEXYSIGN_DEPLOY_HOST }}" >> ~/.ssh/known_hosts || true
-      - name: Stage deploy files
+      - name: Copy app-release helper
         shell: bash
         run: |
-          tar -czf /tmp/lexysign-deploy.tgz deploy/lexysign/docker-compose.runtime.yml deploy/lexysign/Caddyfile
-          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/lexysign_deploy_key -P "${{ vars.LEXYSIGN_DEPLOY_PORT || '22' }}" /tmp/lexysign-deploy.tgz "${{ vars.LEXYSIGN_DEPLOY_USER || 'root' }}@${{ vars.LEXYSIGN_DEPLOY_HOST }}:/tmp/lexysign-deploy-${{ github.sha }}.tgz"
-      - name: Deploy on Hetzner
+          # App-only payload: never stage or overwrite shared Caddyfile/compose/edge.
+          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/lexysign_deploy_key -P "${{ vars.LEXYSIGN_DEPLOY_PORT || '22' }}" \
+            deploy/lexysign/lexysign-app-release.py \
+            "${{ vars.LEXYSIGN_DEPLOY_USER || 'root' }}@${{ vars.LEXYSIGN_DEPLOY_HOST }}:/tmp/lexysign-app-release-${{ github.sha }}.py"
+      - name: Deploy app only on Hetzner
         shell: bash
         run: |
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/lexysign_deploy_key -p "${{ vars.LEXYSIGN_DEPLOY_PORT || '22' }}" "${{ vars.LEXYSIGN_DEPLOY_USER || 'root' }}@${{ vars.LEXYSIGN_DEPLOY_HOST }}" \
-            "GITHUB_SHA='${{ github.sha }}' GITHUB_RUN_ID='${{ github.run_id }}' IMAGE_TAG='${{ needs.select-environment.outputs.image_tag }}' TARGET='${{ needs.select-environment.outputs.target }}' PUBLIC_URL='${{ needs.select-environment.outputs.public_url }}' PROJECT_NAME='${{ needs.select-environment.outputs.project_name }}' DEPLOY_PATH='${{ needs.select-environment.outputs.deploy_path }}' CLIENT_CONTAINER='${{ needs.select-environment.outputs.client_container }}' SERVER_CONTAINER='${{ needs.select-environment.outputs.server_container }}' MONGO_CONTAINER='${{ needs.select-environment.outputs.mongo_container }}' NETWORK_NAME='${{ needs.select-environment.outputs.network_name }}' bash -s" <<'REMOTE'
-          set -euo pipefail
-          mkdir -p "$DEPLOY_PATH/deploy/lexysign"
-          tar -xzf "/tmp/lexysign-deploy-${GITHUB_SHA}.tgz" -C "$DEPLOY_PATH"
-          cd "$DEPLOY_PATH/deploy/lexysign"
-          if [[ ! -f .env ]]; then
-            echo "Missing $PWD/.env. Seed this file from production/staging secrets before deploying." >&2
-            exit 20
-          fi
-          if ! grep -q '^HOST_URL=' .env; then
-            printf '\nHOST_URL=%s\n' "$PUBLIC_URL" >> .env
-          else
-            sed -i "s|^HOST_URL=.*|HOST_URL=${PUBLIC_URL}|" .env
-          fi
-          {
-            echo "LEXYSIGN_IMAGE_TAG=$IMAGE_TAG"
-            echo "LEXYSIGN_PROJECT_NAME=$PROJECT_NAME"
-            echo "LEXYSIGN_CLIENT_CONTAINER=$CLIENT_CONTAINER"
-            echo "LEXYSIGN_SERVER_CONTAINER=$SERVER_CONTAINER"
-            echo "LEXYSIGN_MONGO_CONTAINER=$MONGO_CONTAINER"
-            echo "HOST_URL=$PUBLIC_URL"
-            echo "LEXYSIGN_GIT_SHA=$GITHUB_SHA"
-            echo "LEXYSIGN_GITHUB_RUN_ID=$GITHUB_RUN_ID"
-          } > .deploy.env
-          docker login ghcr.io -u '${{ github.actor }}' -p '${{ secrets.GITHUB_TOKEN }}' >/dev/null 2>&1 || true
-          echo "Pulling LexySign images for $TARGET tag $IMAGE_TAG"
-          timeout 1200s docker compose --env-file .env --env-file .deploy.env -f docker-compose.runtime.yml pull server
-          timeout 1200s docker compose --env-file .env --env-file .deploy.env -f docker-compose.runtime.yml pull client
-          if [[ "$TARGET" == "production" ]]; then
-            if docker inspect lexysign-caddy >/dev/null 2>&1; then
-              existing_project=$(docker inspect lexysign-caddy --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
-              if [[ "$existing_project" != "$PROJECT_NAME" ]]; then
-                docker rm -f lexysign-caddy >/dev/null 2>&1 || true
-              fi
-            fi
-            COMPOSE_PROFILES=edge timeout 600s docker compose --env-file .env --env-file .deploy.env -f docker-compose.runtime.yml up -d --remove-orphans
-          else
-            timeout 600s docker compose --env-file .env --env-file .deploy.env -f docker-compose.runtime.yml up -d --remove-orphans
-          fi
-          if docker ps --format '{{.Names}}' | grep -qx lexysign-caddy; then
-            # Caddyfile is already staged in $DEPLOY_PATH/deploy/lexysign and mounted by the caddy service.
-            for network in "$NETWORK_NAME" lexysign_lexysign lexysign-staging_lexysign lexy-filing-staging_lexy-staging lexycorpus_default "${UTS_INGESTION_NETWORK:-infra_default}" "${DOCASSEMBLE_LEXY_V2_NETWORK:-docassemble-lexy-v2_default}"; do
-              docker network connect "$network" lexysign-caddy 2>/dev/null || true
-            done
-            docker exec lexysign-caddy caddy validate --config /etc/caddy/Caddyfile
-            docker exec lexysign-caddy caddy reload --config /etc/caddy/Caddyfile
-          fi
-          rm -f "/tmp/lexysign-deploy-${GITHUB_SHA}.tgz"
-          REMOTE
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/lexysign_deploy_key -p "${{ vars.LEXYSIGN_DEPLOY_PORT || '22' }}" \
+            "${{ vars.LEXYSIGN_DEPLOY_USER || 'root' }}@${{ vars.LEXYSIGN_DEPLOY_HOST }}" \
+            "GITHUB_SHA='${{ github.sha }}' GITHUB_RUN_ID='${{ github.run_id }}' IMAGE_TAG='${{ needs.select-environment.outputs.image_tag }}' TARGET='${{ needs.select-environment.outputs.target }}' PUBLIC_URL='${{ needs.select-environment.outputs.public_url }}' PROJECT_NAME='${{ needs.select-environment.outputs.project_name }}' DEPLOY_PATH='${{ needs.select-environment.outputs.deploy_path }}' CLIENT_CONTAINER='${{ needs.select-environment.outputs.client_container }}' SERVER_CONTAINER='${{ needs.select-environment.outputs.server_container }}' MONGO_CONTAINER='${{ needs.select-environment.outputs.mongo_container }}' NETWORK_NAME='${{ needs.select-environment.outputs.network_name }}' LEXYSIGN_REGISTRY_USER='${{ github.actor }}' LEXYSIGN_REGISTRY_TOKEN='${{ secrets.GITHUB_TOKEN }}' python3 /tmp/lexysign-app-release-${{ github.sha }}.py release"
       - name: Runtime smoke
         shell: bash
         run: |
-          curl --max-time 45 -fsSIL --retry 8 --retry-delay 5 "${{ needs.select-environment.outputs.public_url }}/" | sed -n '1,12p'
-          curl --max-time 45 -fsSL --retry 8 --retry-delay 5 "${{ needs.select-environment.outputs.public_url }}/api/billing/status" || true
+          PUBLIC_URL='${{ needs.select-environment.outputs.public_url }}' \
+          LEXYSIGN_HTTP_RETRIES='8' \
+          LEXYSIGN_HTTP_RETRY_DELAY='5' \
+          LEXYSIGN_HTTP_MAX_TIME='45' \
+          python3 deploy/lexysign/lexysign-app-release.py smoke-http

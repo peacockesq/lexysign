@@ -47,32 +47,39 @@ export function createParseStub({ records = {} } = {}) {
     constructor(className) {
       this.className = className;
       this._eq = {};
+      this._neq = {};
     }
     equalTo(key, value) {
       this._eq[key] = value;
       return this;
     }
+    notEqualTo(key, value) {
+      this._neq[key] = value;
+      return this;
+    }
     include() {
       return this;
     }
+    matches(row) {
+      const actualOf = (key) => (row.get ? row.get(key) : row[key]);
+      const eqOk = Object.entries(this._eq).every(([key, value]) => {
+        const actual = actualOf(key);
+        if (value && typeof value === "object" && value.objectId) {
+          return actual?.objectId === value.objectId || actual?.id === value.objectId;
+        }
+        return actual === value;
+      });
+      if (!eqOk) return false;
+      return Object.entries(this._neq).every(([key, value]) => actualOf(key) !== value);
+    }
     async first() {
       const list = records[this.className] || [];
-      return (
-        list.find((row) =>
-          Object.entries(this._eq).every(([key, value]) => {
-            const actual = row.get ? row.get(key) : row[key];
-            if (value && typeof value === "object" && value.objectId) {
-              return actual?.objectId === value.objectId || actual?.id === value.objectId;
-            }
-            return actual === value;
-          })
-        ) || null
-      );
+      return list.find((row) => this.matches(row)) || null;
     }
     async get(id) {
       const list = records[this.className] || [];
       const found = list.find((row) => row.id === id || row.objectId === id);
-      if (!found) {
+      if (!found || !this.matches(found)) {
         throw new ParseError(ParseError.OBJECT_NOT_FOUND, "Document not found.");
       }
       return found;

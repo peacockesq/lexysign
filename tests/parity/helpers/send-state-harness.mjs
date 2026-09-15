@@ -1,7 +1,8 @@
-import { readRepoFile } from "./load-source-module.mjs";
+import { readRepoFile, loadSourceModule } from "./load-source-module.mjs";
 import { sliceBetween, runSourceBlock } from "./extract-source.mjs";
 import { createMemoryStorage } from "./dom-stubs.mjs";
-import { openSignSrc } from "./paths.mjs";
+import { createParseStub } from "./parse-stub.mjs";
+import { openSignSrc, serverSrc } from "./paths.mjs";
 
 function fixedDate(iso) {
   return class TestDate extends Date {
@@ -18,6 +19,32 @@ export function placeholderSource(sourceText) {
 
 export function customizeMailSource(sourceText) {
   return sourceText ?? readRepoFile(openSignSrc("components/pdf/CustomizeMail.jsx"));
+}
+
+export function draftDocument() {
+  return {
+    objectId: "doc1",
+    Name: "synthetic",
+    URL: "https://files.example.test/original.pdf",
+    SignedUrl: undefined,
+    SentToOthers: false,
+    SendinOrder: false,
+    TimeToCompleteDays: 15,
+    SignatureType: [],
+    Placeholders: [
+      {
+        Id: "ph-alpha",
+        Role: "signer",
+        signerObjId: "c1",
+        placeHolder: [{ pageNumber: 3, pos: [{ key: "w1", type: "signature" }] }]
+      }
+    ],
+    Signers: [{ objectId: "c1", Email: "alpha@example.test", Role: "signer" }],
+    IsCompleted: false,
+    IsDeclined: false,
+    ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" },
+    ExtUserPtr: { objectId: "ext1", UserId: { objectId: "owner-1" } }
+  };
 }
 
 export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdfDetails, signersdata }) {
@@ -110,6 +137,48 @@ export function runCustomizeMailClose(customizeSrc) {
   return { nav, state };
 }
 
+export function runCustomizeMailSend(customizeSrc, { mailStatus }) {
+  const block = sliceBetween(
+    customizeSrc,
+    "const handleEmailSendToSigners = async () => {",
+    "\n\n  const handleReset"
+  );
+  const state = { isMailModal: true, isSend: false, mailStatus: null, loader: false };
+  const handleEmailSendToSigners = runSourceBlock(
+    block,
+    {
+      setIsLoader: (v) => {
+        state.loader = v;
+      },
+      contractDocument: async () => [{ SendinOrder: false, ExtUserPtr: { Email: "owner@example.test" }, Signers: [] }],
+      props: {
+        documentId: "doc1",
+        setDocumentDetails: () => {},
+        emailEditorType: "basic",
+        customizeMail: { body: { basic: "hi" }, subject: "sign" },
+        signerList: [],
+        defaultMail: {},
+        setIsMailModal: (v) => {
+          state.isMailModal = v;
+        },
+        setIsSend: (v) => {
+          state.isSend = v;
+        },
+        setMailStatus: (v) => {
+          state.mailStatus = v;
+        },
+        setCurrUserId: () => {}
+      },
+      sendEmailToSigners: async () => ({ status: mailStatus }),
+      isCustomize: false,
+      statusMap: { success: "success", "quota-reached": "quotareached" },
+      alert: () => {}
+    },
+    "handleEmailSendToSigners"
+  );
+  return { handleEmailSendToSigners, state };
+}
+
 export function runReopenLock(placeholderSrc, documentData, nowIso) {
   const block = sliceBetween(
     placeholderSrc,
@@ -130,48 +199,95 @@ export function runReopenLock(placeholderSrc, documentData, nowIso) {
   return placed;
 }
 
-export async function runInterruptedSendSequence({ placeholderSrc, customizeSrc } = {}) {
-  const placeholder = placeholderSource(placeholderSrc);
-  const customize = customizeMailSource(customizeSrc);
-  const pdfUrl = "https://files.example.test/doc.pdf";
-  const documentId = "doc1";
-  const pdfDetails = [
-    {
-      Name: "synthetic",
-      SendinOrder: false,
-      TimeToCompleteDays: 15,
-      SignatureType: [],
-      Placeholders: [],
-      ExtUserPtr: { UserId: { objectId: "owner-1" } }
-    }
-  ];
-  const signersdata = [{ Email: "alpha@example.test", objectId: "c1", Role: "signer" }];
-  const save = runSaveDocumentDetails(placeholder, {
-    pdfUrl,
-    documentId,
-    pdfDetails,
-    signersdata
-  });
-  await save.saveDocumentDetails();
-  const close = runCustomizeMailClose(customize);
-  const reopenDoc = [
-    {
-      SignedUrl: save.puts[0]?.data?.SignedUrl,
-      IsCompleted: false,
-      IsDeclined: false,
-      ExpiryDate: { iso: "2026-10-01T00:00:00.000Z" }
-    }
-  ];
-  const placed = runReopenLock(placeholder, reopenDoc, "2026-09-15T12:00:00.000Z");
-  return {
-    put: save.puts[0],
-    mailModalAfterSave: save.state.isMailModal,
-    close,
-    placed
-  };
+export function isLockedAgainstEdit(placed) {
+  return Boolean(placed[0]?.status);
 }
 
 export function isDispatchedLock(placed) {
   const lock = placed[0];
   return Boolean(lock?.status && lock?.message === "document-signed-alert-8");
 }
+
+function jsonClone(value) {
+  return JSON.parse(JSON.stringify(value, (_k, v) => (v === undefined ? null : v)));
+}
+
+export function mergePersistedDocument(original, putPayload) {
+  const merged = { ...original, ...putPayload };
+  if (putPayload?.ExpiryDate?.iso instanceof Date) {
+    merged.ExpiryDate = { iso: putPayload.ExpiryDate.iso.toISOString(), __type: "Date" };
+  }
+  return merged;
+}
+
+export async function applyDocumentBeforesaveStamps(original, nextAttrs) {
+  const Parse = createParseStub();
+  const { exports } = loadSourceModule(serverSrc("cloud/parsefunction/DocumentBeforesave.js"), {
+    stubs: {
+      "../../Utils.js": {
+        MAX_DESCRIPTION_LENGTH: 500,
+        MAX_NAME_LENGTH: 250,
+        MAX_NOTE_LENGTH: 200
+      },
+      "../../utils/CountUtils.js": { setDocumentCount: () => {} },
+      "../../billing/entitlements.js": {
+        getTenantForExtUser: async () => ({ id: "tenant1" }),
+        recordESignUsage: async () => 1
+      }
+    },
+    globals: { Parse }
+  });
+  const originalObj = new Parse.Object("contracts_Document", {
+    ...original,
+    ExtUserPtr: original.ExtUserPtr?.id ? original.ExtUserPtr : { id: original.ExtUserPtr?.objectId }
+  });
+  const nextObj = new Parse.Object("contracts_Document", nextAttrs);
+  await exports.default({ original: originalObj, object: nextObj });
+  const stamps = {};
+  if (nextObj.get("DocSentAt")) stamps.DocSentAt = nextObj.get("DocSentAt");
+  return stamps;
+}
+
+export async function persistAfterSave(original, putPayload) {
+  const merged = mergePersistedDocument(original, putPayload);
+  const stamps = await applyDocumentBeforesaveStamps(original, merged);
+  return {
+    document: { ...merged, ...stamps },
+    provenance: {
+      originalKeys: Object.keys(original),
+      putKeys: Object.keys(putPayload || {}),
+      beforeSave: Object.keys(stamps)
+    }
+  };
+}
+
+export async function runInterruptedSendSequence({ placeholderSrc, customizeSrc } = {}) {
+  const placeholder = placeholderSource(placeholderSrc);
+  const customize = customizeMailSource(customizeSrc);
+  const original = draftDocument();
+  const pdfUrl = "https://files.example.test/doc.pdf";
+  const pdfDetails = [original];
+  const signersdata = [
+    { Email: "alpha@example.test", objectId: "c1", Role: "signer", UserId: { objectId: "user-alpha" } }
+  ];
+  const save = runSaveDocumentDetails(placeholder, {
+    pdfUrl,
+    documentId: original.objectId,
+    pdfDetails,
+    signersdata
+  });
+  await save.saveDocumentDetails();
+  const close = runCustomizeMailClose(customize);
+  const persisted = await persistAfterSave(original, save.puts[0].data);
+  const placed = runReopenLock(placeholder, [persisted.document], "2026-09-15T12:00:00.000Z");
+  return {
+    original,
+    put: save.puts[0],
+    persisted,
+    mailModalAfterSave: save.state.isMailModal,
+    close,
+    placed
+  };
+}
+
+export { jsonClone };

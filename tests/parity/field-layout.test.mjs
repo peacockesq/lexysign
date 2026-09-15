@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { loadSourceModule, readRepoFile } from "./helpers/load-source-module.mjs";
-import { FakeImage, installDomStubs } from "./helpers/dom-stubs.mjs";
+import { loadUtilsModule } from "./helpers/utils-loader.mjs";
 import { openSignSrc } from "./helpers/paths.mjs";
 
 const fixture = JSON.parse(
@@ -12,35 +12,7 @@ const fixture = JSON.parse(
 let utilsExports;
 function loadUtils() {
   if (utilsExports) return utilsExports;
-  const dom = installDomStubs();
-  utilsExports = loadSourceModule(openSignSrc("constant/Utils.js"), {
-    stubs: {
-      axios: {},
-      moment: () => ({ format: () => "", isValid: () => true }),
-      "pdf-lib": { PDFDocument: {}, rgb: () => ({}), degrees: () => ({}) },
-      parse: { User: { current: () => null }, Object: class {}, Cloud: { run: async () => ({}) } },
-      "./appinfo": { appInfo: {} },
-      "file-saver": { saveAs: () => {} },
-      "print-js": () => {},
-      "@pdf-lib/fontkit": {},
-      "./const": { themeColor: "#000" },
-      "date-fns-tz": { format: () => "", toZonedTime: (d) => d },
-      "../i18n": { t: (k) => k },
-      "../utils": {
-        applyNumberFormulasToPages: (pages) => pages,
-        buildDownloadFilename: () => "file.pdf",
-        addPreferenceOpt: () => ({})
-      }
-    },
-    globals: {
-      window: dom.window,
-      document: dom.document,
-      localStorage: dom.localStorage,
-      Image: FakeImage,
-      atob: (value) => Buffer.from(value, "base64").toString("binary"),
-      btoa: (value) => Buffer.from(value, "binary").toString("base64")
-    }
-  }).exports;
+  utilsExports = loadUtilsModule().exports;
   return utilsExports;
 }
 
@@ -58,8 +30,10 @@ describe("field layout utilities", () => {
     assert.equal(date.height, 20);
   });
 
-  it("handleImageResize writes widget dimensions in unscaled page space", () => {
+  it("handleWidgetResize writes widget dimensions in unscaled page space", () => {
     const utils = loadUtils();
+    assert.equal(typeof utils.handleImageResize, "undefined");
+    assert.equal(typeof utils.handleWidgetResize, "function");
     let next = null;
     const signerPos = [
       {
@@ -72,7 +46,7 @@ describe("field layout utilities", () => {
         ]
       }
     ];
-    utils.handleImageResize(
+    utils.handleWidgetResize(
       { offsetWidth: 271, offsetHeight: 50 },
       "w1",
       signerPos,
@@ -80,7 +54,6 @@ describe("field layout utilities", () => {
         next = value;
       },
       3,
-      1,
       1,
       "signer-a",
       true

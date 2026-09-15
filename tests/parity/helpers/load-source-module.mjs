@@ -18,22 +18,25 @@ function convertNamedImportBlock(named) {
 
 function rewriteImports(source) {
   return source.replace(
-    /^[ \t]*import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"][ \t]*;?[ \t]*$/gm,
-    (_match, bindings, spec) => {
+    /(?:^|[ \t])import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"][ \t]*;?/gm,
+    (match, bindings, spec) => {
       const stubExpr = `globalThis.__requireStub(${JSON.stringify(spec)})`;
       const trimmed = bindings.trim();
+      let rewritten;
       if (trimmed.startsWith("* as ")) {
         const name = trimmed.slice(5).trim();
-        return `const ${name} = ${stubExpr};`;
+        rewritten = `const ${name} = ${stubExpr};`;
+      } else if (trimmed.startsWith("{")) {
+        rewritten = `const ${convertNamedImportBlock(trimmed)} = ${stubExpr};`;
+      } else {
+        const defaultAndNamed = trimmed.match(/^([A-Za-z_$][\w$]*)\s*,\s*(\{[\s\S]*\})$/);
+        if (defaultAndNamed) {
+          rewritten = `const ${defaultAndNamed[1]} = ${stubExpr};\nconst ${convertNamedImportBlock(defaultAndNamed[2])} = ${stubExpr};`;
+        } else {
+          rewritten = `const ${trimmed} = ${stubExpr};`;
+        }
       }
-      if (trimmed.startsWith("{")) {
-        return `const ${convertNamedImportBlock(trimmed)} = ${stubExpr};`;
-      }
-      const defaultAndNamed = trimmed.match(/^([A-Za-z_$][\w$]*)\s*,\s*(\{[\s\S]*\})$/);
-      if (defaultAndNamed) {
-        return `const ${defaultAndNamed[1]} = ${stubExpr};\nconst ${convertNamedImportBlock(defaultAndNamed[2])} = ${stubExpr};`;
-      }
-      return `const ${trimmed} = ${stubExpr};`;
+      return match.startsWith("import") ? rewritten : ` ${rewritten}`;
     }
   );
 }

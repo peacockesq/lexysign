@@ -5,7 +5,15 @@ import { openSignSrc } from "./paths.mjs";
 export const UTILS_STUBS = {
   axios: { post: async () => ({ data: {} }), get: async () => ({ data: {} }) },
   moment: () => ({ format: () => "", isValid: () => true }),
-  "pdf-lib": { PDFDocument: {}, rgb: () => ({}), degrees: () => ({}) },
+  "pdf-lib": {
+    PDFDocument: {},
+    rgb: () => ({}),
+    degrees: () => ({}),
+    PDFName: {},
+    StandardFonts: {},
+    PDFArray: {},
+    PDFDict: {}
+  },
   parse: {
     User: { current: () => null },
     Object: class {},
@@ -16,7 +24,7 @@ export const UTILS_STUBS = {
   "file-saver": { saveAs: () => {} },
   "print-js": () => {},
   "@pdf-lib/fontkit": {},
-  "./const": { themeColor: "#000" },
+  "./const": { themeColor: "#000", SCALE_STEPS: [1] },
   "date-fns-tz": { format: () => "", toZonedTime: (d) => d },
   "../i18n": { t: (k) => k },
   "../utils": {

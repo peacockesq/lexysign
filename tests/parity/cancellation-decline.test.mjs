@@ -15,7 +15,10 @@ const UTILS_STUB = {
 function syntheticEnvelope(Parse, extra = {}) {
   const doc = new Parse.Object("contracts_Document", {
     IsEnableOTP: false,
+    IsCompleted: false,
+    IsArchive: false,
     Name: "synthetic-packet",
+    CreatedBy: { objectId: "owner-1" },
     Placeholders: [
       {
         Role: "signer",
@@ -35,20 +38,18 @@ function syntheticEnvelope(Parse, extra = {}) {
     },
     ...extra
   });
-  doc.id = extra.objectId || "doc-decline";
+  doc.id = extra.objectId || extra.id || "doc-decline";
   return doc;
 }
 
 function loadDecline(Parse, mail) {
   return loadSourceModule(serverSrc("cloud/parsefunction/declinedocument.js"), {
     stubs: {
-      axios: {
-        post: async (_url, params) => {
-          mail.push(params);
-          return { data: {} };
-        }
-      },
-      "../../Utils.js": UTILS_STUB
+      "../../Utils.js": UTILS_STUB,
+      "./sendSystemMail.js": async (req) => {
+        mail.push(req.params);
+        return { status: "success" };
+      }
     },
     globals: { Parse, process }
   });
@@ -68,7 +69,7 @@ describe("cancellation / decline checks", () => {
     );
   });
 
-  it("declines without OTP even when request.user is missing and sends owner mail", async () => {
+  it("declines without OTP even when request.user is missing and sends owner mail via sendSystemMail", async () => {
     const Parse = createParseStub();
     const doc = syntheticEnvelope(Parse);
     Parse.records.contracts_Document = [doc];
@@ -93,9 +94,13 @@ describe("cancellation / decline checks", () => {
       assert.equal(doc.get("DeclineBy").objectId, "user-1");
       assert.equal(errors.length, 0, "sendDeclineMail must not swallow a TypeError");
       assert.equal(mail.length, 1);
+      assert.equal(mail[0].extUserId, "ext1");
+      assert.equal(mail[0].from, "LexySign");
       assert.equal(mail[0].recipient, "sender@example.test");
+      assert.equal(mail[0].pdfName, "synthetic-packet");
       assert.match(mail[0].subject, /declined by Alpha/);
       assert.match(mail[0].html, /not signing/);
+      assert.match(mail[0].html, /sender@example.test/);
     } finally {
       console.log = originalError;
     }
@@ -143,7 +148,7 @@ describe("cancellation / decline checks", () => {
     assert.match(fn, /userId:\s*userId/);
   });
 
-  it("RED: declinedocument should refuse an already completed envelope", async () => {
+  it("declinedocument rejects a completed envelope and does not mail the owner", async () => {
     const Parse = createParseStub();
     const doc = syntheticEnvelope(Parse, { IsCompleted: true, objectId: "doc-complete" });
     doc.id = "doc-complete";
@@ -156,8 +161,9 @@ describe("cancellation / decline checks", () => {
           params: { docId: "doc-complete", reason: "too late", userId: "user-1" },
           headers: { public_url: "https://sign.lexyalgo.com" }
         }),
-      /completed|already/i
+      (err) => err.code === Parse.Error.OBJECT_NOT_FOUND
     );
     assert.equal(doc.get("IsDeclined"), undefined);
+    assert.equal(mail.length, 0);
   });
 });

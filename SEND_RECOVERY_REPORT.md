@@ -3,6 +3,7 @@
 Worktree: `/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/send-recovery`
 Branch: `fix/lexysign-first-invitation-recovery`
 Base: `36d8771eeb828edb7ee267e1c3e912cb7782fd0d`
+Ending SHA: `89a7a5623b547832380a3aa1708cc5494fea41ab`
 No remote, SSH, push, deploy, or real email.
 
 ## What changed

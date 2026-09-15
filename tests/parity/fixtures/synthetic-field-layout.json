@@ -1,0 +1,19 @@
+{
+  "source": "synthetic-signing-packet.pdf",
+  "sha256": "31737a1808bd7cdc7e6cca5bdf6f8a85897da6ce7fe585c9dad7150d4ff475ca",
+  "pages": 3,
+  "page_size": [612, 792],
+  "signature_boxes_pdf_top_origin": {
+    "alpha": [54, 162, 271, 50],
+    "alpha_date": [375, 172, 175, 35],
+    "beta": [54, 362, 271, 50],
+    "beta_date": [375, 372, 175, 35],
+    "alpha_initials": [160, 540, 85, 30]
+  },
+  "sparse_draw_canvas": {
+    "width": 800,
+    "height": 200,
+    "ink_width": 80,
+    "ink_height": 20
+  }
+}

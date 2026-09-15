@@ -20,7 +20,7 @@
 
 ## Repo state
 
-- Repo: `https://github.com/peacockesq/peacock-sign`
+- Repo: `https://github.com/peacockesq/lexysign`
 - Base branch: `staging`
 - Prep branch: `lexysign-hetzner-prep`
 
@@ -54,7 +54,7 @@ On Hetzner:
 ssh -i /Users/bot/.ssh/id_ed25519_hostinger root@37.27.49.209
 mkdir -p /opt/lexysign
 cd /opt/lexysign
-git clone --branch lexysign-hetzner-prep https://github.com/peacockesq/peacock-sign.git .
+git clone --branch lexysign-hetzner-prep https://github.com/peacockesq/lexysign.git .
 cd deploy/lexysign
 HOST_URL=https://sign.lexyalgo.com bash ./lexysign-generate-env.sh
 # edit .env for Supabase, Stripe, and SMTP before any real users

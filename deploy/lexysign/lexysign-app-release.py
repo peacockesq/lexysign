@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -41,6 +42,31 @@ RELAY_ENV_KEYS = (
     "SMTP_RELAY_HOST",
     "RELAY_HOST",
 )
+# Official Mailpit forward/relay activation only
+# (https://mailpit.axllent.org/docs/configuration/smtp-relay/ and
+# https://mailpit.axllent.org/docs/configuration/smtp-forward/). Optional
+# companion fields without host/config/to are ignored by Mailpit and are not
+# treated as outbound here. Explicit false for relay-all is inert.
+MAILPIT_CONFIG_ENV = (
+    "MP_SMTP_RELAY_CONFIG",
+    "MP_SMTP_FORWARD_CONFIG",
+)
+MAILPIT_HOST_ENV = (
+    "MP_SMTP_RELAY_HOST",
+    "MP_SMTP_FORWARD_HOST",
+)
+MAILPIT_TO_ENV = (
+    "MP_SMTP_FORWARD_TO",
+    "MP_FORWARD_TO",
+)
+MAILPIT_MATCHING_ENV = ("MP_SMTP_RELAY_MATCHING",)
+MAILPIT_RELAY_ALL_ENV = "MP_SMTP_RELAY_ALL"
+MAILPIT_CONFIG_FLAGS = ("--smtp-relay-config", "--smtp-forward-config")
+MAILPIT_MATCHING_FLAGS = ("--smtp-relay-matching",)
+MAILPIT_RELAY_ALL_FLAGS = ("--smtp-relay-all",)
+MAILPIT_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+MAILPIT_FALSY = frozenset({"0", "false", "no", "off", "n", "f", ""})
+_TAR_FILTER = getattr(tarfile, "tar_filter", None)
 FORBIDDEN_DOCKER_TOKENS = (
     "caddy",
     "--remove-orphans",
@@ -265,6 +291,132 @@ def env_map(raw: Any) -> dict[str, str]:
     return out
 
 
+def _mailpit_enabled(raw: str) -> bool:
+    text = raw.strip().casefold()
+    if text in MAILPIT_FALSY:
+        return False
+    if text in MAILPIT_TRUTHY:
+        return True
+    return bool(text)
+
+
+def _env_lookup_ci(env_values: Mapping[str, str], key: str) -> tuple[str, str] | None:
+    wanted = key.casefold()
+    for raw_key, raw_val in env_values.items():
+        if str(raw_key).casefold() == wanted:
+            return str(raw_key), "" if raw_val is None else str(raw_val)
+    return None
+
+
+def _argv_from_inspect(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    tokens: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if any(ch.isspace() for ch in text):
+            try:
+                tokens.extend(shlex.split(text, posix=True))
+            except ValueError:
+                tokens.append(text)
+            continue
+        tokens.append(text)
+    return tokens
+
+
+def _mailpit_cli_activation(argv: Sequence[str]) -> str | None:
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = str(argv[i])
+        if not tok.startswith("-"):
+            i += 1
+            continue
+        folded = tok.casefold()
+        name, eq, value = folded.partition("=")
+        original_name = tok.split("=", 1)[0]
+        if name in MAILPIT_CONFIG_FLAGS or name in MAILPIT_MATCHING_FLAGS:
+            if eq:
+                taken = value
+                i += 1
+            elif i + 1 < n and not str(argv[i + 1]).startswith("-"):
+                taken = str(argv[i + 1])
+                i += 2
+            else:
+                taken = ""
+                i += 1
+            if taken.strip():
+                return f"CLI {original_name} activates Mailpit forward/relay"
+            return f"CLI {original_name} is present"
+        if name in MAILPIT_RELAY_ALL_FLAGS:
+            if eq:
+                enabled = _mailpit_enabled(value)
+                i += 1
+            elif i + 1 < n:
+                nxt = str(argv[i + 1])
+                nxt_fold = nxt.strip().casefold()
+                if nxt_fold in MAILPIT_TRUTHY or nxt_fold in MAILPIT_FALSY:
+                    enabled = _mailpit_enabled(nxt)
+                    i += 2
+                else:
+                    enabled = True
+                    i += 1
+            else:
+                enabled = True
+                i += 1
+            if enabled:
+                return "CLI --smtp-relay-all activates Mailpit relay-all"
+            continue
+        i += 1
+    return None
+
+
+def mailpit_outbound_reason(doc: Mapping[str, Any]) -> str | None:
+    config = doc.get("Config") or {}
+    env_values = env_map(config.get("Env"))
+    activation_env = (
+        RELAY_ENV_KEYS
+        + MAILPIT_CONFIG_ENV
+        + MAILPIT_HOST_ENV
+        + MAILPIT_TO_ENV
+        + MAILPIT_MATCHING_ENV
+    )
+    seen: set[str] = set()
+    for key in activation_env:
+        folded = key.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        found = _env_lookup_ci(env_values, key)
+        if found and found[1].strip():
+            return f"environment {found[0]} activates Mailpit forward/relay"
+    found_all = _env_lookup_ci(env_values, MAILPIT_RELAY_ALL_ENV)
+    if found_all and _mailpit_enabled(found_all[1]):
+        return f"environment {found_all[0]} activates Mailpit relay-all"
+    argv = _argv_from_inspect(config.get("Entrypoint")) + _argv_from_inspect(config.get("Cmd"))
+    cli = _mailpit_cli_activation(argv)
+    if cli:
+        return cli
+    mounts = doc.get("Mounts") or []
+    if isinstance(mounts, list):
+        for mount in mounts:
+            if not isinstance(mount, Mapping):
+                continue
+            # tmpfs /tmp (Mailpit database) and ordinary binds are not outbound.
+            _ = mount.get("Type") or mount.get("Destination")
+    return None
+
+
 def smtp_error(reason: str) -> ReleaseError:
     supported = ", ".join(sorted(STAGING_SMTP_SINK_HOSTS))
     return ReleaseError(
@@ -380,10 +532,61 @@ def _verify_mongo_gzip(path: Path) -> None:
             ) from exc
 
 
+def _drain_gzip_to_eof(path: Path, label: str) -> None:
+    with path.open("rb") as raw:
+        gzip_magic = raw.read(2)
+        if gzip_magic != b"\x1f\x8b":
+            raise ReleaseError(f"{label} is not a gzip archive (missing gzip magic)", 23)
+        raw.seek(0)
+        try:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as handle:
+                while handle.read(GZIP_CHUNK):
+                    pass
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise ReleaseError(
+                f"{label} gzip is truncated, CRC-corrupt, or not a valid gzip archive",
+                23,
+            ) from exc
+
+
+def _tar_member_path_illegal(member: tarfile.TarInfo) -> str | None:
+    name = member.name or ""
+    if not name.strip() or "\x00" in name:
+        return name or "<empty>"
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or (len(normalized) > 1 and normalized[1] == ":"):
+        return name
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        return name
+    if member.issym() or member.islnk():
+        link = (member.linkname or "").replace("\\", "/")
+        if link.startswith("/") or any(part == ".." for part in link.split("/") if part):
+            return name
+    if _TAR_FILTER is not None:
+        try:
+            _TAR_FILTER(member, ".")
+        except (tarfile.FilterError, ValueError, OSError):
+            return name
+    return None
+
+
 def _verify_files_tar(path: Path) -> None:
+    _drain_gzip_to_eof(path, "files_backup")
     try:
         with tarfile.open(path, "r:*") as archive:
-            members = [member for member in archive.getmembers() if member.isfile()]
+            members = []
+            for member in archive.getmembers():
+                illegal = _tar_member_path_illegal(member)
+                if illegal is not None:
+                    raise ReleaseError(
+                        f"files_backup tar contains a malicious or invalid member path {illegal!r}",
+                        23,
+                    )
+                if member.isfile():
+                    members.append(member)
+    except ReleaseError:
+        raise
     except (OSError, tarfile.TarError) as exc:
         raise ReleaseError("files_backup is not an openable tar/gzip archive", 23) from exc
     if not members:
@@ -954,12 +1157,11 @@ def validate_sink_container(cfg: Mapping[str, str], host: str) -> None:
         raise smtp_error(
             f"local sink {host!r} is not on the staging app network {cfg['network_name']}."
         )
-    env_values = env_map((doc.get("Config") or {}).get("Env"))
-    for key in RELAY_ENV_KEYS:
-        if env_values.get(key, "").strip():
-            raise smtp_error(
-                f"local sink {host!r} has relay/forwarding enabled; refusing (no SES/remote relay)."
-            )
+    outbound = mailpit_outbound_reason(doc)
+    if outbound:
+        raise smtp_error(
+            f"local sink {host!r} has relay/forwarding enabled ({outbound}); refusing (no SES/remote relay)."
+        )
 
 
 def resolve_pulled_candidates(cfg: Mapping[str, str]) -> dict[str, dict[str, str]]:
@@ -1055,24 +1257,23 @@ def verify_running_images(cfg: Mapping[str, str], candidates: Mapping[str, Mappi
     timeout = float(os.environ.get("LEXYSIGN_HEALTH_TIMEOUT", "120"))
     poll = float(os.environ.get("LEXYSIGN_HEALTH_POLL", "2"))
     deadline = time.monotonic() + max(timeout, 0)
-    pending = ["client", "server"]
-    while pending:
-        still: list[str] = []
-        for kind in pending:
+    intended = ("client", "server")
+    while True:
+        waiting: list[str] = []
+        for kind in intended:
             name = cfg[f"{kind}_container"]
             doc = inspect_container(cfg, name)
             outcome = assert_live_app_container(name, doc, cfg, kind, candidates[kind])
             if outcome == "wait":
-                still.append(kind)
-        if not still:
+                waiting.append(kind)
+        if not waiting:
             return
         if time.monotonic() >= deadline:
             raise ReleaseError(
-                f"app healthcheck did not become healthy within {timeout}s ({', '.join(still)} still starting)",
+                f"app healthcheck did not become healthy within {timeout}s ({', '.join(waiting)} still starting)",
                 25,
             )
         time.sleep(max(poll, 0))
-        pending = still
 
 
 def http_retries() -> tuple[int, float, int]:

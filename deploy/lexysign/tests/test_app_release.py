@@ -6,6 +6,7 @@ Uses a fake command environment. No Docker daemon, SSH, or network I/O.
 
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import importlib.util
@@ -18,6 +19,7 @@ import sys
 import tarfile
 import tempfile
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -613,6 +615,108 @@ def expect_raises(fn, exc_type, substr: str) -> None:
             raise AssertionError(f"expected {substr!r} in {exc}") from exc
         return
     raise AssertionError(f"{exc_type.__name__} was not raised")
+
+
+@contextmanager
+def patched_inspect(doc_or_fn):
+    orig = app.inspect_container
+    if callable(doc_or_fn):
+        app.inspect_container = doc_or_fn
+    else:
+        app.inspect_container = lambda _cfg, _name: doc_or_fn
+    try:
+        yield
+    finally:
+        app.inspect_container = orig
+
+
+def inert_sink_doc(*, env=None, cmd=None, entrypoint=None, mounts=None) -> dict:
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+
+    def command_field(value, default):
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value
+        return list(value)
+
+    return {
+        "State": {"Running": True, "Restarting": False, "Dead": False},
+        "Config": {
+            "Env": list(env) if env is not None else ["MP_SMTP_RELAY_ALL=false"],
+            "ExposedPorts": {"1025/tcp": {}},
+            "Entrypoint": command_field(entrypoint, ["/mailpit"]),
+            "Cmd": command_field(cmd, ["--listen", "127.0.0.1:8025"]),
+        },
+        "NetworkSettings": {
+            "Networks": {cfg["network_name"]: {}},
+            "Ports": {"1025/tcp": [{"HostPort": "1025"}]},
+        },
+        "Mounts": list(mounts)
+        if mounts is not None
+        else [{"Type": "tmpfs", "Destination": "/tmp", "Source": "tmpfs", "RW": True}],
+        "HostConfig": {"PortBindings": {"1025/tcp": [{"HostPort": "1025"}]}},
+    }
+
+
+def call_validate_sink(doc) -> None:
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    with patched_inspect(doc):
+        app.validate_sink_container(cfg, "mailpit")
+
+
+def expect_sink_rejected(doc, substr: str = "relay") -> None:
+    expect_raises(lambda: call_validate_sink(doc), app.ReleaseError, substr)
+
+
+def _staging_backup_with_files(
+    root: Path, *, raw_tgz: bytes | None = None, tar_name: str | None = None
+) -> Path:
+    (root / "deploy" / "lexysign").mkdir(parents=True, exist_ok=True)
+    manifest = write_valid_backup(root, "staging")
+    data = json.loads(manifest.read_text())
+    files = Path(data["files_backup"])
+    if raw_tgz is not None:
+        files.write_bytes(raw_tgz)
+    elif tar_name is not None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            payload = b"signed-doc"
+            info = tarfile.TarInfo(name=tar_name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        files.write_bytes(buffer.getvalue())
+    blob = files.read_bytes()
+    data["files_backup_sha256"] = sha256_bytes(blob)
+    data["files_backup_bytes"] = len(blob)
+    manifest.write_text(json.dumps(data))
+    return manifest
+
+
+def live_app_doc(
+    cfg: dict,
+    kind: str,
+    candidate_id: str,
+    *,
+    running: bool = True,
+    health: str = "healthy",
+    image: str | None = None,
+    image_id: str | None = None,
+    revision: str | None = None,
+) -> dict:
+    return {
+        "State": {
+            "Running": running,
+            "Status": "running" if running else "exited",
+            "Dead": False,
+            "Health": {"Status": health},
+        },
+        "Image": image_id or candidate_id,
+        "Config": {
+            "Image": image or app.expected_image(cfg, kind),
+            "Labels": {"org.opencontainers.image.revision": revision or cfg["github_sha"]},
+        },
+    }
 
 
 @test("smtp_fail_ses_host")
@@ -1568,6 +1672,311 @@ def _():
     assert "--remove-orphans" in text
     assert "COMPOSE_PROFILES=edge" not in text
     assert "LEXYSIGN_APP_RELEASE_TEST" not in text
+
+
+@test("sink_inert_baseline_allows_disabled_relay_all_tmpfs_loopback_ui")
+def _():
+    call_validate_sink(inert_sink_doc())
+
+
+@test("sink_rejects_reviewer_forward_host_to_env")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(
+            env=[
+                "MP_SMTP_FORWARD_HOST=smtp.example.test",
+                "MP_SMTP_FORWARD_TO=review@example.test",
+            ]
+        )
+    )
+
+
+@test("sink_rejects_reviewer_relay_config_and_relay_all_true")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(env=["MP_SMTP_RELAY_CONFIG=/config/relay.yml", "MP_SMTP_RELAY_ALL=true"])
+    )
+
+
+@test("sink_rejects_reviewer_forward_config_env")
+def _():
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_FORWARD_CONFIG=/config/forward.yml"]))
+
+
+@test("sink_rejects_reviewer_cli_relay_config_and_relay_all")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(cmd=["--smtp-relay-config", "/config/relay.yml", "--smtp-relay-all"])
+    )
+
+
+@test("sink_rejects_known_relay_host_negative")
+def _():
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_HOST=smtp.example.test"]))
+
+
+@test("sink_rejects_neighboring_equals_cli_and_matching")
+def _():
+    expect_sink_rejected(
+        inert_sink_doc(cmd=["--smtp-relay-config=/config/relay.yml", "--smtp-relay-all=true"])
+    )
+    expect_sink_rejected(inert_sink_doc(cmd=["--smtp-forward-config=/config/forward.yml"]))
+    expect_sink_rejected(
+        inert_sink_doc(cmd=["--smtp-relay-matching", "(user1@host1\\.com|@host3\\.com)$"])
+    )
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_MATCHING=@example.com$"]))
+
+
+@test("sink_rejects_neighboring_to_spellings_and_case_boolean")
+def _():
+    expect_sink_rejected(inert_sink_doc(env=["MP_FORWARD_TO=review@example.test"]))
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_FORWARD_TO=review@example.test"]))
+    expect_sink_rejected(inert_sink_doc(env=["mp_smtp_forward_host=smtp.example.test"]))
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=TRUE"]))
+    expect_sink_rejected(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=1"]))
+    expect_sink_rejected(inert_sink_doc(cmd=["--SMTP-RELAY-ALL"]))
+    expect_sink_rejected(
+        inert_sink_doc(entrypoint=["/mailpit", "--smtp-forward-config", "/config/forward.yml"], cmd=[])
+    )
+    expect_sink_rejected(inert_sink_doc(cmd="--smtp-relay-config /config/relay.yml --smtp-relay-all"))
+
+
+@test("sink_allows_explicit_false_relay_all_spellings")
+def _():
+    call_validate_sink(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=false"]))
+    call_validate_sink(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=FALSE"]))
+    call_validate_sink(inert_sink_doc(env=["MP_SMTP_RELAY_ALL=0"]))
+    call_validate_sink(inert_sink_doc(cmd=["--listen", "127.0.0.1:8025", "--smtp-relay-all=false"]))
+    call_validate_sink(inert_sink_doc(cmd=["--smtp-relay-all", "false"]))
+
+
+@test("backup_files_gzip_bad_crc_honest_manifest_fails")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        data = json.loads(manifest.read_text())
+        files = Path(data["files_backup"])
+        good = files.read_bytes()
+        app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW)
+        bad = bytearray(good)
+        bad[-8] ^= 1
+        files.write_bytes(bad)
+        try:
+            gzip.decompress(bytes(bad))
+            raise AssertionError("gzip must reject CRC-invalid fixture")
+        except gzip.BadGzipFile:
+            pass
+        data["files_backup_sha256"] = sha256_bytes(bytes(bad))
+        data["files_backup_bytes"] = len(bad)
+        manifest.write_text(json.dumps(data))
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "CRC-corrupt",
+        )
+
+
+@test("backup_files_gzip_truncated_fails")
+def _():
+    payload = b"signed-doc"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        info = tarfile.TarInfo(name="files/doc.pdf")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    truncated = buf.getvalue()[:-16]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        manifest = _staging_backup_with_files(root, raw_tgz=truncated)
+        expect_raises(
+            lambda: app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW),
+            app.ReleaseError,
+            "truncated",
+        )
+
+
+@test("backup_files_good_archive_still_passes")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "deploy" / "lexysign").mkdir(parents=True)
+        manifest = write_valid_backup(root, "staging")
+        app.validate_backup_manifest(manifest, cfg_for("staging", str(root)), now=NOW)
+
+
+@test("backup_files_malicious_tar_paths_fail")
+def _():
+    for name in ("../escape.txt", "/etc/passwd", "files/../../etc/shadow"):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = _staging_backup_with_files(root, tar_name=name)
+            expect_raises(
+                lambda m=manifest, r=root: app.validate_backup_manifest(
+                    m, cfg_for("staging", str(r)), now=NOW
+                ),
+                app.ReleaseError,
+                "malicious or invalid member path",
+            )
+
+
+@test("files_gzip_verifier_does_not_read_whole_file")
+def _():
+    import inspect as pyinspect
+
+    source = (
+        pyinspect.getsource(app._verify_files_tar)
+        + pyinspect.getsource(app._drain_gzip_to_eof)
+        + pyinspect.getsource(app._tar_member_path_illegal)
+    )
+    assert "read_bytes" not in source
+    assert "decompress(" not in source
+
+
+@test("health_rechecks_client_that_dies_while_server_starts")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    candidates = {
+        "client": {"id": "sha256:client"},
+        "server": {"id": "sha256:server"},
+    }
+    counts = {"client": 0, "server": 0}
+    live = {
+        "client": live_app_doc(cfg, "client", "sha256:client"),
+        "server": live_app_doc(cfg, "server", "sha256:server"),
+    }
+
+    def inspect(_cfg, name):
+        kind = "client" if name == cfg["client_container"] else "server"
+        counts[kind] += 1
+        if kind == "server" and counts[kind] == 1:
+            live["client"]["State"] = {"Running": False, "Status": "exited", "Health": {"Status": "unhealthy"}}
+            doc = copy.deepcopy(live["server"])
+            doc["State"]["Health"]["Status"] = "starting"
+            return doc
+        return copy.deepcopy(live[kind])
+
+    prev_timeout = os.environ.get("LEXYSIGN_HEALTH_TIMEOUT")
+    prev_poll = os.environ.get("LEXYSIGN_HEALTH_POLL")
+    os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = "30"
+    os.environ["LEXYSIGN_HEALTH_POLL"] = "0"
+    try:
+        with patched_inspect(inspect):
+            expect_raises(lambda: app.verify_running_images(cfg, candidates), app.ReleaseError, "not running")
+        assert counts["client"] >= 2
+        assert not live["client"]["State"]["Running"]
+    finally:
+        if prev_timeout is None:
+            os.environ.pop("LEXYSIGN_HEALTH_TIMEOUT", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = prev_timeout
+        if prev_poll is None:
+            os.environ.pop("LEXYSIGN_HEALTH_POLL", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_POLL"] = prev_poll
+
+
+@test("health_rechecks_client_unhealthy_while_server_starts")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    candidates = {"client": {"id": "sha256:client"}, "server": {"id": "sha256:server"}}
+    counts = {"client": 0, "server": 0}
+
+    def inspect(_cfg, name):
+        kind = "client" if name == cfg["client_container"] else "server"
+        counts[kind] += 1
+        if kind == "client" and counts[kind] == 1:
+            return live_app_doc(cfg, "client", "sha256:client")
+        if kind == "client":
+            return live_app_doc(cfg, "client", "sha256:client", health="unhealthy")
+        if counts["server"] == 1:
+            return live_app_doc(cfg, "server", "sha256:server", health="starting")
+        return live_app_doc(cfg, "server", "sha256:server")
+
+    prev_timeout = os.environ.get("LEXYSIGN_HEALTH_TIMEOUT")
+    prev_poll = os.environ.get("LEXYSIGN_HEALTH_POLL")
+    os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = "30"
+    os.environ["LEXYSIGN_HEALTH_POLL"] = "0"
+    try:
+        with patched_inspect(inspect):
+            expect_raises(lambda: app.verify_running_images(cfg, candidates), app.ReleaseError, "not healthy")
+        assert counts["client"] >= 2
+    finally:
+        if prev_timeout is None:
+            os.environ.pop("LEXYSIGN_HEALTH_TIMEOUT", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = prev_timeout
+        if prev_poll is None:
+            os.environ.pop("LEXYSIGN_HEALTH_POLL", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_POLL"] = prev_poll
+
+
+@test("health_rechecks_client_image_drift_while_server_starts")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    candidates = {"client": {"id": "sha256:client"}, "server": {"id": "sha256:server"}}
+    counts = {"client": 0, "server": 0}
+
+    def inspect(_cfg, name):
+        kind = "client" if name == cfg["client_container"] else "server"
+        counts[kind] += 1
+        if kind == "client" and counts[kind] == 1:
+            return live_app_doc(cfg, "client", "sha256:client")
+        if kind == "client":
+            return live_app_doc(
+                cfg,
+                "client",
+                "sha256:client",
+                image="ghcr.io/peacockesq/lexysign-client:wrong-tag",
+                image_id="sha256:drifted",
+            )
+        if counts["server"] == 1:
+            return live_app_doc(cfg, "server", "sha256:server", health="starting")
+        return live_app_doc(cfg, "server", "sha256:server")
+
+    prev_timeout = os.environ.get("LEXYSIGN_HEALTH_TIMEOUT")
+    prev_poll = os.environ.get("LEXYSIGN_HEALTH_POLL")
+    os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = "30"
+    os.environ["LEXYSIGN_HEALTH_POLL"] = "0"
+    try:
+        with patched_inspect(inspect):
+            expect_raises(lambda: app.verify_running_images(cfg, candidates), app.ReleaseError, "does not match")
+        assert counts["client"] >= 2
+    finally:
+        if prev_timeout is None:
+            os.environ.pop("LEXYSIGN_HEALTH_TIMEOUT", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_TIMEOUT"] = prev_timeout
+        if prev_poll is None:
+            os.environ.pop("LEXYSIGN_HEALTH_POLL", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_POLL"] = prev_poll
+
+
+@test("health_both_healthy_same_observation_pass")
+def _():
+    cfg = cfg_for("staging", "/opt/lexysign-staging")
+    candidates = {"client": {"id": "sha256:client"}, "server": {"id": "sha256:server"}}
+    counts = {"client": 0, "server": 0}
+
+    def inspect(_cfg, name):
+        kind = "client" if name == cfg["client_container"] else "server"
+        counts[kind] += 1
+        return live_app_doc(cfg, kind, candidates[kind]["id"])
+
+    prev_poll = os.environ.get("LEXYSIGN_HEALTH_POLL")
+    os.environ["LEXYSIGN_HEALTH_POLL"] = "0"
+    try:
+        with patched_inspect(inspect):
+            app.verify_running_images(cfg, candidates)
+        assert counts == {"client": 1, "server": 1}
+    finally:
+        if prev_poll is None:
+            os.environ.pop("LEXYSIGN_HEALTH_POLL", None)
+        else:
+            os.environ["LEXYSIGN_HEALTH_POLL"] = prev_poll
 
 
 def main() -> int:

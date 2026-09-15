@@ -11,7 +11,7 @@ Status at end of coding worker: local merge commit only. No push, PR, deploy, or
 - Upstream tag SHA: `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`
 - Actual git merge-base(`HEAD`, `v2.41.3`) before merge: `b9a309fa36a17c1b8678d12b940de0d36c032935` (`Merge pull request #2143 from OpenSignLabs/staging`)
 - Task-stated merge-base: `197c00dd79f8ceded909c2edb4560355fb0f8e07` (`Merge pull request #2142`). That commit is a first-parent ancestor of `b9a309fa`; git's merge-base with the fetched tag is `b9a309fa`. The merge used the real merge-base.
-- Ending SHA: see “Staging merge and CI follow-up” below. Upstream merge commit remains `4393ae23ab67d4af15dde3c0909d4a678504f825` (parents `d4212d402325551cb9cb903038adfab76afe7b89` and `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`).
+- Ending SHA: `d07108dc85bdb73ec8c7561ab4383057224d8065` (CI/test-runner follow-up on top of staging merge `c38469ea493392f45daeb8d3eb9b0fc5667d3980`). Upstream merge commit remains `4393ae23ab67d4af15dde3c0909d4a678504f825` (parents `d4212d402325551cb9cb903038adfab76afe7b89` and `e5f2c5c0a9f65ec01d8a53e4bf3a390c7ade7bcd`).
 
 Do not treat `apps/OpenSign/package.json` / `apps/OpenSignServer/package.json` `version: 2.37.0` as provenance. Upstream tag `v2.41.3` itself still carries that stale metadata. `apps/OpenSign/public/version.txt` was updated by upstream.
 

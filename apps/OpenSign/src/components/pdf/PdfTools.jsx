@@ -161,6 +161,7 @@ function PdfTools(props) {
       if (pdfupdatedData) {
         props.setPdfArrayBuffer(pdfupdatedData.arrayBuffer);
         props.setPdfBase64Url(pdfupdatedData.base64);
+        props.setIsUploadPdf && props.setIsUploadPdf(true);
         props.setAllPages(pdfupdatedData.totalPages);
         props.setPageNumber(1);
       }

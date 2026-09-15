@@ -107,6 +107,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/OpenSign/package-lock.json
+      - name: Install client lockfile deps for PDF regressions
+        working-directory: apps/OpenSign
+        run: npm ci --omit=dev --no-audit --no-fund --ignore-scripts
+      - name: Install poppler-utils for PDF text assertions
+        run: sudo apt-get update -y && sudo apt-get install -y poppler-utils
       - name: Run parity tests
         shell: bash
         run: |

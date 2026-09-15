@@ -64,3 +64,7 @@ This patch does not give exactly-once mail.
 - No bulk backfill of historical `SignedUrl` drafts.
 
 Do not treat this as a delivery-retry or concurrent-tab design.
+
+## Review-product follow-up (same worktree, later commit)
+
+Same-tab Share-then-Send and same-tab failed-before-mail retry now use an in-memory activation receipt. Reload / other tabs still have no receipt and stay already-dispatched. Concurrent tabs and outbox exactly-once are still not claimed. Prefill Next no longer replaces `URL`; prepared output is `PreparedUrl`. See `REVIEW_PRODUCT_FIX_REPORT.md`.

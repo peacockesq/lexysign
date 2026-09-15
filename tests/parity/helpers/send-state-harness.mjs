@@ -6,9 +6,14 @@ import { openSignSrc, serverSrc } from "./paths.mjs";
 import {
   applyDraftFieldsToPdfDetails,
   assertActiveSession,
+  beginDraftPersistenceWrite,
+  bindDraftActivationReceipt,
   buildDraftSavePayload,
   buildFinalizePayload,
+  commitDraftPersistenceWrite,
   evaluateFinalizeGuard,
+  isDraftPersistenceUiCurrent,
+  isDraftPersistenceWriteCurrent,
   shouldExposeSignerShareLinks
 } from "../../../apps/OpenSign/src/utils/draftDocumentPreparation.js";
 
@@ -64,7 +69,7 @@ function createLocalStorage() {
   return localStorage;
 }
 
-export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdfDetails, signersdata, axiosPut }) {
+export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdfDetails, signersdata, axiosPut, isUploadPdf = false, pdfBase64Url = "", convertBase64ToFile, generatePdfName }) {
   const block = sliceBetween(
     placeholderSrc,
     "const saveDocumentDetails = utils.withSessionValidation(async () => {",
@@ -87,11 +92,23 @@ export function runSaveDocumentDetails(placeholderSrc, { pdfUrl, documentId, pdf
       utils: { withSessionValidation: (fn) => fn },
       buildDraftSavePayload,
       applyDraftFieldsToPdfDetails,
+      beginDraftPersistenceWrite,
+      commitDraftPersistenceWrite,
+      isDraftPersistenceUiCurrent,
+      isDraftPersistenceWriteCurrent,
       setIsUiLoading: (v) => {
         state.isUiLoading = v;
       },
       signersdata,
       pdfDetails,
+      isUploadPdf,
+      pdfBase64Url,
+      generatePdfName: generatePdfName || (() => "synthetic-clean"),
+      convertBase64ToFile:
+        convertBase64ToFile ||
+        (async () => {
+          throw new Error("convertBase64ToFile is only used when isUploadPdf is true");
+        }),
       embedPrefilllWidgets: async () => pdfUrl,
       currentId: signersdata[0].Email,
       setCurrentId: (v) => {
@@ -142,12 +159,15 @@ export function runFinalizeInvitation(placeholderSrc, { documentId, pdfDetails, 
   const puts = [];
   const state = { pdfDetails };
   const localStorage = createLocalStorage();
+  const draftActivationReceiptRef = { current: null };
   const finalizeInvitation = runSourceBlock(
     block,
     {
       assertActiveSession,
       evaluateFinalizeGuard,
       buildFinalizePayload,
+      bindDraftActivationReceipt,
+      draftActivationReceiptRef,
       contractDocument,
       documentId,
       pdfDetails,

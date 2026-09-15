@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "lexysign-firm": {
+      "command": "/ABS/PATH/TO/lexysign/scripts/mcp/.venv/bin/python",
+      "args": ["-u", "-m", "lexysign_firm_mcp"],
+      "env": {
+        "LEXYSIGN_MCP_CONFIG": "/home/trixie/.hermes/profiles/cain/secrets/lexysign-mcp.json"
+      }
+    }
+  }
+}

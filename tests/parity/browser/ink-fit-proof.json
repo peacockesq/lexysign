@@ -1,0 +1,82 @@
+{
+  "ok": true,
+  "chromium": "Chromium 152.0.7977.82 built on Debian GNU/Linux 13 (trixie)",
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/152.0.0.0 Safari/537.36",
+  "dpr": 1,
+  "pxRatio": 2,
+  "source": {
+    "width": 800,
+    "height": 200,
+    "ink": {
+      "x": 360,
+      "y": 90,
+      "w": 80,
+      "h": 20
+    }
+  },
+  "before150": {
+    "cssInkH": 4,
+    "cssInkW": 15,
+    "heightFill": 0.08,
+    "stats": {
+      "count": 240,
+      "minX": 135,
+      "minY": 46,
+      "maxX": 164,
+      "maxY": 53,
+      "bboxW": 30,
+      "bboxH": 8,
+      "width": 300,
+      "height": 100
+    }
+  },
+  "after150": {
+    "cssInkH": 37,
+    "cssInkW": 144.5,
+    "heightFill": 0.74,
+    "stats": {
+      "count": 21386,
+      "minX": 6,
+      "minY": 13,
+      "maxX": 294,
+      "maxY": 86,
+      "bboxW": 289,
+      "bboxH": 74,
+      "width": 300,
+      "height": 100
+    }
+  },
+  "after271": {
+    "cssInkH": 43.5,
+    "cssInkW": 168.5,
+    "heightFill": 0.87,
+    "stats": {
+      "count": 29318,
+      "minX": 103,
+      "minY": 7,
+      "maxX": 439,
+      "maxY": 93,
+      "bboxW": 337,
+      "bboxH": 87,
+      "width": 542,
+      "height": 100
+    }
+  },
+  "stamp150": {
+    "cssInkH": 4,
+    "heightFill": 0.08,
+    "stats": {
+      "count": 240,
+      "minX": 135,
+      "minY": 46,
+      "maxX": 164,
+      "maxY": 53,
+      "bboxW": 30,
+      "bboxH": 8,
+      "width": 300,
+      "height": 100
+    }
+  },
+  "beforePng": "/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/ink/tests/parity/browser/ink-fit-before.png",
+  "afterPng": "/home/trixie/.hermes/profiles/cain/workspace/lexysign-upgrade-20260915/ink/tests/parity/browser/ink-fit-after.png"
+}

@@ -1710,44 +1710,168 @@ export function clearResponse(widgetKey, placeholder = [], index) {
  * Scales and centers a base64‐encoded image into a fixed‐size widget
  * and returns a new base64 PNG.
  *
+ * Drawn signature/initials/draw widgets crop non-ink padding (transparent
+ * pixels, including leftover RGB at alpha 0, and conservative near-white
+ * upload backgrounds) before fitting. Stamp/image/unknown types keep the
+ * full bitmap and the historical no-upscale policy.
+ *
+ * Sparse cropped ink may be scaled up to fill the widget (aspect preserved).
+ * Filled sources that already occupy the bitmap keep no-upscale.
+ *
  * @param {string} base64Image  A data-URL (e.g. "data:image/png;base64,…")
  * @param {{ Width: number, Height: number }} widgetDims
+ * @param {string} [widgetType]
  * @returns {Promise<string>}  A Promise that resolves to a data-URL of the new image
  */
-export async function convertBase64ToImg(base64Image, widgetDims) {
-  const { Width: maxWidth, Height: maxHeight } = widgetDims;
-  // Load the image off-DOM
+export async function convertBase64ToImg(base64Image, widgetDims, widgetType) {
+  const MAX_SRC_DIM = 4096;
+  const MAX_WIDGET_CSS = 2048;
+  const MAX_CANVAS_PX = 8192;
+  const LOAD_MS = 8000;
+  const SAFETY_PAD = 2;
+  const NEAR_WHITE = 250;
+  const NEAR_WHITE_CHROMA = 8;
+  const SPARSE_AREA = 0.5;
+  const TRIM_TYPES = { signature: true, initials: true, draw: true };
+
+  const fail = (reason) => {
+    throw new Error(`convertBase64ToImg: ${reason}`);
+  };
+
+  if (!widgetDims || typeof widgetDims !== "object") {
+    fail("invalid widget dimensions");
+  }
+  const maxWidth = Number(widgetDims.Width);
+  const maxHeight = Number(widgetDims.Height);
+  if (
+    !Number.isFinite(maxWidth) ||
+    !Number.isFinite(maxHeight) ||
+    maxWidth <= 0 ||
+    maxHeight <= 0 ||
+    maxWidth > MAX_WIDGET_CSS ||
+    maxHeight > MAX_WIDGET_CSS
+  ) {
+    fail("invalid widget dimensions");
+  }
+  if (typeof base64Image !== "string" || base64Image.length === 0) {
+    fail("invalid image");
+  }
+
+  const typeKey =
+    typeof widgetType === "string" ? widgetType.trim().toLowerCase() : "";
+  const trimToInk = Boolean(TRIM_TYPES[typeKey]);
+
   const img = new Image();
-  img.src = base64Image;
-  await new Promise((resolve, reject) => {
-    img.onload = resolve;
-    img.onerror = reject;
+  const loaded = new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("convertBase64ToImg: image load timeout")),
+      LOAD_MS
+    );
+    img.onload = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("convertBase64ToImg: image load failed"));
+    };
   });
+  img.src = base64Image;
+  await loaded;
 
-  // 2. Compute scale to fit within widget (preserving aspect ratio)
-  const { naturalWidth: imgW, naturalHeight: imgH } = img;
-  const scale = Math.min(maxWidth / imgW, maxHeight / imgH, 1);
-  const drawW = imgW * scale;
-  const drawH = imgH * scale;
+  const imgW = Number(img.naturalWidth || img.width);
+  const imgH = Number(img.naturalHeight || img.height);
+  if (
+    !Number.isFinite(imgW) ||
+    !Number.isFinite(imgH) ||
+    imgW < 1 ||
+    imgH < 1 ||
+    imgW > MAX_SRC_DIM ||
+    imgH > MAX_SRC_DIM
+  ) {
+    fail("invalid image dimensions");
+  }
 
-  // 3. Prepare a high-DPI canvas
+  let sx = 0;
+  let sy = 0;
+  let sw = imgW;
+  let sh = imgH;
+  let allowUpscale = false;
+
+  if (trimToInk) {
+    const measure = document.createElement("canvas");
+    measure.width = imgW;
+    measure.height = imgH;
+    const mctx = measure.getContext("2d");
+    if (!mctx) fail("canvas unsupported");
+    mctx.drawImage(img, 0, 0, imgW, imgH);
+    const { data } = mctx.getImageData(0, 0, imgW, imgH);
+    let minX = imgW;
+    let minY = imgH;
+    let maxX = -1;
+    let maxY = -1;
+    const count = imgW * imgH;
+    for (let i = 0; i < count; i += 1) {
+      const o = i * 4;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const a = data[o + 3];
+      if (a < 1) continue;
+      const maxc = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const minc = r < g ? (r < b ? r : b) : g < b ? g : b;
+      if (minc >= NEAR_WHITE && maxc - minc <= NEAR_WHITE_CHROMA) continue;
+      const x = i % imgW;
+      const y = (i / imgW) | 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+    if (maxX < minX) fail("no ink in image");
+    sx = Math.max(0, minX - SAFETY_PAD);
+    sy = Math.max(0, minY - SAFETY_PAD);
+    const ex = Math.min(imgW - 1, maxX + SAFETY_PAD);
+    const ey = Math.min(imgH - 1, maxY + SAFETY_PAD);
+    sw = ex - sx + 1;
+    sh = ey - sy + 1;
+    allowUpscale = (sw * sh) / (imgW * imgH) < SPARSE_AREA;
+  }
+
+  const scale = Math.min(
+    maxWidth / sw,
+    maxHeight / sh,
+    allowUpscale ? Number.POSITIVE_INFINITY : 1
+  );
+  if (!Number.isFinite(scale) || scale <= 0) fail("invalid scale");
+  const drawW = sw * scale;
+  const drawH = sh * scale;
+
   const pxRatio = (window.devicePixelRatio || 1) * 2;
+  if (!Number.isFinite(pxRatio) || pxRatio <= 0) fail("invalid pixel ratio");
+  const canvasW = Math.ceil(maxWidth * pxRatio);
+  const canvasH = Math.ceil(maxHeight * pxRatio);
+  if (
+    !Number.isFinite(canvasW) ||
+    !Number.isFinite(canvasH) ||
+    canvasW < 1 ||
+    canvasH < 1 ||
+    canvasW > MAX_CANVAS_PX ||
+    canvasH > MAX_CANVAS_PX
+  ) {
+    fail("canvas size out of bounds");
+  }
+
   const canvas = document.createElement("canvas");
-  canvas.width = Math.ceil(maxWidth * pxRatio);
-  canvas.height = Math.ceil(maxHeight * pxRatio);
+  canvas.width = canvasW;
+  canvas.height = canvasH;
   const ctx = canvas.getContext("2d");
+  if (!ctx) fail("canvas unsupported");
   ctx.scale(pxRatio, pxRatio);
   ctx.clearRect(0, 0, maxWidth, maxHeight);
-
-  // 4. Center the image in the widget rectangle
   const x = (maxWidth - drawW) / 2;
   const y = (maxHeight - drawH) / 2;
-  ctx.drawImage(img, x, y, drawW, drawH);
-  // 5. Return new base64 in same format as input
-  // const quality =
-  //   inputMime.includes("jpeg") || inputMime.includes("jpg") ? 0.9 : undefined;
-  // return canvas.toDataURL(inputMime, quality);
-  // 5. Always return PNG (lossless, no quality param needed)
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, drawW, drawH);
   return canvas.toDataURL("image/png");
 }
 
@@ -2124,7 +2248,8 @@ export const embedWidgetsToDoc = async (
             // const mime = arr[0].match(/:(.*?);/)[1];
             const signatureImg = await convertBase64ToImg(
               signbase64,
-              widgetDims
+              widgetDims,
+              widget.type
             );
             const mime = signatureImg?.split(",")?.[0]?.match(/:(.*?);/)?.[1];
             const res = await fetch(signatureImg);
